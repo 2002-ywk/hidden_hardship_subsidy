@@ -1,0 +1,62 @@
+{
+  "name": "react-example",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx server.ts",
+    "build": "vite build",
+    "preview": "vite preview",
+    "clean": "rm -rf dist",
+    "lint": "tsc --noEmit",
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push",
+    "db:comment:tables": "node --import tsx prisma/apply-table-comments.ts",
+    "db:comment:columns": "node --import tsx prisma/apply-column-comments.ts",
+    "db:comment": "npm run db:comment:tables && npm run db:comment:columns",
+    "db:seed": "tsx prisma/seed.ts",
+    "db:reset": "prisma db push --force-reset && npm run db:seed",
+    "db:purge": "tsx scripts/purge-cloud-db.ts",
+    "db:drop-fks": "tsx scripts/drop-foreign-keys.ts",
+    "db:collation:unicode": "tsx scripts/normalize-db-collation.ts"
+  },
+  "dependencies": {
+    "@base-ui/react": "^1.4.0",
+    "@fontsource-variable/geist": "^5.2.8",
+    "@google/genai": "^1.29.0",
+    "@prisma/client": "^6.16.2",
+    "@tailwindcss/vite": "^4.1.14",
+    "@vitejs/plugin-react": "^5.0.4",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "date-fns": "^4.1.0",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "express-session": "^1.19.0",
+    "lucide-react": "^0.546.0",
+    "motion": "^12.23.24",
+    "prisma": "^6.16.2",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-is": "^19.2.5",
+    "react-router-dom": "^7.14.1",
+    "recharts": "^3.8.1",
+    "shadcn": "^4.2.0",
+    "tailwind-merge": "^3.5.0",
+    "tw-animate-css": "^1.4.0",
+    "vite": "^6.2.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/express-session": "^1.19.0",
+    "@types/node": "^22.14.0",
+    "autoprefixer": "^10.4.21",
+    "tailwindcss": "^4.1.14",
+    "tsx": "^4.21.0",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  }
+}

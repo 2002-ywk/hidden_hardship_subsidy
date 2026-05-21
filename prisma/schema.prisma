@@ -1,0 +1,380 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+  relationMode = "prisma"
+}
+
+model User {
+  id           String          @id @default(cuid())
+  account      String          @unique
+  employeeNo   String?         @unique
+  name         String
+  email        String?         @unique
+  role         String
+  college      String?
+  status       String          @default("active")
+  createdAt    DateTime        @default(now()) @db.DateTime(0)
+  updatedAt    DateTime        @updatedAt @db.DateTime(0)
+  createdById  String?
+  createdBy    User?           @relation("UserCreator", fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdUsers User[]          @relation("UserCreator")
+  counselorRelations CounselorStudentRelation[] @relation("CounselorAssignments")
+  reviewRecords ReviewRecord[] @relation("ReviewReviewer")
+  operationLogs OperationLog[] @relation("UserOperationLogs")
+  syncJobs     SyncJob[] @relation("SyncJobTrigger")
+
+  @@index([role])
+  @@index([college])
+}
+
+model Student {
+  id                    String                   @id @default(cuid())
+  studentId             String                   @unique
+  name                  String                   @default("")
+  classCode             String                   @default("")
+  personTypeCode        String                   @default("")
+  isReadingCode         String                   @default("")
+  isRegisteredCode      String                   @default("")
+  genderCode            String                   @default("")
+  departmentName        String                   @default("")
+  createdAt             DateTime                 @default(now()) @db.DateTime(0)
+  updatedAt             DateTime                 @updatedAt @db.DateTime(0)
+  relations             CounselorStudentRelation[]
+  monthStats            StudentMonthStat[]
+  candidateResults      CandidateResult[]
+  reviewRecords         ReviewRecord[]
+  tagRecords            TagRecord[]
+  finalSubsidyResults   FinalSubsidyResult[]
+  difficultyRecognitions UndergraduateDifficultyRecognition[]
+
+  @@index([departmentName])
+}
+
+model UndergraduateDifficultyRecognition {
+  id                 String   @id @default(cuid())
+  studentId          String
+  startAcademicYear  String
+  endAcademicYear    String
+  semester           String
+  difficultyLevel    String   @default("")
+  createdAt          DateTime @default(now()) @db.DateTime(0)
+  updatedAt          DateTime @updatedAt @db.DateTime(0)
+  student            Student  @relation(fields: [studentId], references: [id])
+
+  @@unique([studentId, startAcademicYear, endAcademicYear, semester])
+  @@index([startAcademicYear, endAcademicYear, semester])
+  @@index([difficultyLevel])
+}
+
+model CounselorStudentRelation {
+  id             String    @id @default(cuid())
+  counselorId    String
+  studentId      String
+  relationType   String    @default("student")
+  effectiveFrom  DateTime? @db.DateTime(0)
+  effectiveTo    DateTime? @db.DateTime(0)
+  createdAt      DateTime  @default(now()) @db.DateTime(0)
+  updatedAt      DateTime  @updatedAt @db.DateTime(0)
+  counselor      User      @relation("CounselorAssignments", fields: [counselorId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  student        Student   @relation(fields: [studentId], references: [id])
+
+  @@unique([counselorId, studentId, relationType])
+  @@index([studentId])
+}
+
+model SubsidyBatch {
+  id                   String               @id @default(cuid())
+  month                String               @unique
+  status               String
+  progress             Int                  @default(0)
+  startTime            DateTime             @default(now()) @db.DateTime(0)
+  deadline             DateTime?            @db.DateTime(0)
+  finalReviewTime      DateTime?            @db.DateTime(0)
+  endTime              DateTime?            @db.DateTime(0)
+  ruleVersion          String?
+  standardPercentile   Float                @default(0.25)
+  basePercentile       Float                @default(0.5)
+  finalRatio           Float                @default(0.015)
+  candidateResults     CandidateResult[]
+  monthStats           StudentMonthStat[]
+  reviewRecords        ReviewRecord[]
+  tagRecords           TagRecord[]
+  finalSubsidyResults  FinalSubsidyResult[]
+  createdAt            DateTime             @default(now()) @db.DateTime(0)
+  updatedAt            DateTime             @updatedAt @db.DateTime(0)
+
+  @@index([status])
+}
+
+model StudentMonthStat {
+  id                  String       @id @default(cuid())
+  batchId             String
+  studentId           String
+  month               String
+  breakfastCount      Int          @default(0)
+  breakfastTotal      Decimal
+  breakfastAvg        Decimal
+  lunchDinnerCount    Int          @default(0)
+  lunchDinnerTotal    Decimal
+  lunchDinnerAvg      Decimal
+  daysCount           Int          @default(0)
+  attendanceDays      Int          @default(0)
+  totalAmount         Decimal
+  createdAt           DateTime     @default(now()) @db.DateTime(0)
+  updatedAt           DateTime     @updatedAt @db.DateTime(0)
+  batch               SubsidyBatch @relation(fields: [batchId], references: [id])
+  student             Student      @relation(fields: [studentId], references: [id])
+
+  @@unique([batchId, studentId])
+  @@index([month])
+}
+
+model CandidateResult {
+  id                  String             @id @default(cuid())
+  batchId             String
+  studentId           String
+  month               String
+  candidateType       String
+  typeLabel           String
+  workflowStatus      String
+  workflowStatusLabel String
+  currentStage        String
+  averageSpendLabel   String?
+  daysCount           Int                @default(0)
+  rank                Int?
+  subsidyEstimate     Decimal?
+  reviewDeadline      DateTime?           @db.DateTime(0)
+  included            Boolean            @default(true)
+  createdAt           DateTime           @default(now()) @db.DateTime(0)
+  updatedAt           DateTime           @updatedAt @db.DateTime(0)
+  batch               SubsidyBatch       @relation(fields: [batchId], references: [id])
+  student             Student            @relation(fields: [studentId], references: [id])
+  hitRules            CandidateHitRule[]
+
+  @@unique([batchId, studentId])
+  @@index([month, workflowStatus])
+  @@index([candidateType])
+}
+
+model CandidateHitRule {
+  id                String           @id @default(cuid())
+  candidateResultId String
+  ruleCode          String?
+  ruleText          String
+  createdAt         DateTime         @default(now()) @db.DateTime(0)
+  candidateResult   CandidateResult  @relation(fields: [candidateResultId], references: [id], onDelete: Cascade)
+
+  @@index([candidateResultId])
+}
+
+model CandidateListSnapshot {
+  id                  String   @id @default(cuid())
+  month               String
+  batchId             String
+  studentId           String
+  name                String
+  college             String
+  className           String
+  counselor           String
+  type                String
+  typeLabel           String
+  averageSpendLabel   String
+  daysCount           Int      @default(0)
+  workflowStatus      String
+  workflowStatusLabel String
+  currentStage        String
+  rank                Int      @default(0)
+  subsidyEstimate     Decimal?
+  reviewDeadline      DateTime? @db.DateTime(0)
+  tagsJson            String   @db.LongText
+  hitRulesJson        String   @db.LongText
+  createdAt           DateTime @default(now()) @db.DateTime(0)
+  updatedAt           DateTime @updatedAt @db.DateTime(0)
+
+  @@unique([month, studentId])
+  @@index([month, rank])
+  @@index([month, workflowStatus])
+}
+
+model ReviewRecord {
+  id            String       @id @default(cuid())
+  batchId       String
+  studentId     String
+  stage         String
+  decision      String
+  resultLabel   String
+  comment       String?
+  isTimeout     Boolean      @default(false)
+  reviewedAt    DateTime     @default(now()) @db.DateTime(0)
+  reviewerId    String?
+  reviewerName  String?
+  createdAt     DateTime     @default(now()) @db.DateTime(0)
+  batch         SubsidyBatch @relation(fields: [batchId], references: [id])
+  student       Student      @relation(fields: [studentId], references: [id])
+  reviewer      User?        @relation("ReviewReviewer", fields: [reviewerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([batchId, studentId])
+  @@index([stage, decision])
+}
+
+model TagRecord {
+  id            String       @id @default(cuid())
+  batchId       String
+  studentId     String
+  tag           String
+  sourceStage   String
+  status        String       @default("active")
+  generatedAt   DateTime     @default(now()) @db.DateTime(0)
+  invalidatedAt DateTime?    @db.DateTime(0)
+  createdAt     DateTime     @default(now()) @db.DateTime(0)
+  batch         SubsidyBatch @relation(fields: [batchId], references: [id])
+  student       Student      @relation(fields: [studentId], references: [id])
+
+  @@index([batchId, studentId])
+  @@index([tag, status])
+}
+
+model FinalSubsidyResult {
+  id                 String       @id @default(cuid())
+  batchId            String
+  studentId          String
+  finalDecision      String
+  finalRank          Int?
+  selected           Boolean      @default(false)
+  breakfastSubsidy   Decimal
+  lunchDinnerSubsidy Decimal
+  totalSubsidy       Decimal
+  createdAt          DateTime     @default(now()) @db.DateTime(0)
+  updatedAt          DateTime     @updatedAt @db.DateTime(0)
+  batch              SubsidyBatch @relation(fields: [batchId], references: [id])
+  student            Student      @relation(fields: [studentId], references: [id])
+
+  @@unique([batchId, studentId])
+  @@index([selected, finalDecision])
+}
+
+model SystemConfig {
+  id                   Int       @id
+  breakfastStart       String
+  breakfastEnd         String
+  lunchStart           String
+  lunchEnd             String
+  dinnerStart          String
+  dinnerEnd            String
+  subsidyLimit         Decimal
+  finalRatio           Float
+  standardPercentile   Float
+  basePercentile       Float
+  timeoutWorkdays      Int       @default(7)
+  createdAt            DateTime  @default(now()) @db.DateTime(0)
+  updatedAt            DateTime  @updatedAt @db.DateTime(0)
+}
+
+model RolePermission {
+  id           String   @id @default(cuid())
+  role         String
+  permission   String
+  dataScope    String
+  createdAt    DateTime @default(now()) @db.DateTime(0)
+  updatedAt    DateTime @updatedAt @db.DateTime(0)
+
+  @@unique([role, permission])
+  @@index([role])
+}
+
+model OperationLog {
+  id            String   @id @default(cuid())
+  operatorId    String?
+  operatorRole  String?
+  targetType    String
+  targetId      String?
+  action        String
+  content       String
+  createdAt     DateTime @default(now()) @db.DateTime(0)
+  operator      User?    @relation("UserOperationLogs", fields: [operatorId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([targetType, targetId])
+  @@index([createdAt])
+}
+
+model FacultyStaff {
+  id                 String   @id @default(cuid())
+  employeeNo         String   @unique
+  name               String   @default("")
+  genderCode         String   @default("")
+  unitName           String   @default("")
+  staffCategoryCode  String   @default("")
+  currentStatusCode  String   @default("")
+  createdAt          DateTime @default(now()) @db.DateTime(0)
+  updatedAt          DateTime @updatedAt @db.DateTime(0)
+
+  @@index([unitName])
+}
+
+model DictionaryItem {
+  id                  String   @id @default(cuid())
+  dictType            String
+  code                String
+  label               String
+  isSpecialDifficulty Boolean  @default(false)
+  sortOrder           Int      @default(0)
+  enabled             Boolean  @default(true)
+  description         String   @default("")
+  createdAt           DateTime @default(now()) @db.DateTime(0)
+  updatedAt           DateTime @updatedAt @db.DateTime(0)
+
+  @@unique([dictType, code])
+  @@index([dictType, sortOrder, code])
+}
+
+model DictionaryType {
+  id          String   @id @default(cuid())
+  dictType    String   @unique
+  label       String
+  description String   @default("")
+  sortOrder   Int      @default(0)
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now()) @db.DateTime(0)
+  updatedAt   DateTime @updatedAt @db.DateTime(0)
+
+  @@index([sortOrder, dictType])
+}
+
+model SyncJob {
+  id            String   @id @default(cuid())
+  name          String
+  source        String
+  jobType       String
+  frequency     String?
+  status        String
+  delta         String?
+  note          String?
+  lastRunAt     DateTime? @db.DateTime(0)
+  startedAt     DateTime? @db.DateTime(0)
+  finishedAt    DateTime? @db.DateTime(0)
+  triggeredById String?
+  createdAt     DateTime @default(now()) @db.DateTime(0)
+  updatedAt     DateTime @updatedAt @db.DateTime(0)
+  triggeredBy   User?    @relation("SyncJobTrigger", fields: [triggeredById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([jobType, status])
+}
+
+model AuditReviewerAssignment {
+  id         String   @id @default(cuid())
+  stage      String
+  college    String?
+  userId     String
+  status     String   @default("active")
+  createdAt  DateTime @default(now()) @db.DateTime(0)
+  updatedAt  DateTime @updatedAt @db.DateTime(0)
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([stage, status])
+  @@index([college])
+  @@unique([stage, userId, college])
+}

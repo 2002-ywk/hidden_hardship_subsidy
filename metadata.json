@@ -1,0 +1,6 @@
+{
+  "name": "Undergraduate Invisible Subsidy System",
+  "description": "A data-driven system to identify and provide subsidies to students in need based on campus consumption patterns.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
