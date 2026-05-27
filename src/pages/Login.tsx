@@ -13,13 +13,17 @@ export default function Login() {
     fetchMe()
       .then(() => {
         if (cancelled) return;
-        navigate('/', { replace: true });
+        const redirect = searchParams.get('redirect');
+        const target = redirect && redirect.startsWith('/') ? redirect : '/';
+        navigate(target, { replace: true });
       })
       .catch(() => {
         if (cancelled) return;
         setMessage('正在跳转统一认证登录...');
         const reauth = searchParams.get('reauth') === '1' ? '&reauth=1' : '';
-        window.location.href = `/api/auth/login/jmu?role=counselor${reauth}`;
+        const redirect = searchParams.get('redirect');
+        const redirectParam = redirect ? `&redirect=${encodeURIComponent(redirect)}` : '';
+        window.location.href = `/api/auth/login/jmu?role=counselor${reauth}${redirectParam}`;
       });
 
     return () => {

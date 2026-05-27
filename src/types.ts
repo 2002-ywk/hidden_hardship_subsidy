@@ -352,6 +352,8 @@ export interface AuthUser {
   name: string;
   role: UserRole;
   college?: string | null;
+  canFundingOfficeReview?: boolean;
+  canFinalReview?: boolean;
 }
 
 export interface AuthLoginRequest {
@@ -421,6 +423,20 @@ export interface CandidateSearchItem {
 
 export interface CandidateSearchResponse {
   items: CandidateSearchItem[];
+}
+
+export interface CandidateReminderRequest {
+  month: string;
+}
+
+export interface CandidateReminderResponse {
+  message: string;
+  data: {
+    total: number;
+    success: number;
+    failed: number;
+    failedItems: Array<{ studentId: string; reason: string }>;
+  };
 }
 
 export interface BatchCreateRequest {
@@ -689,5 +705,30 @@ export interface SyncTerminateAllResponse {
   data: {
     terminated: number;
     jobIds: string[];
+  };
+}
+
+export type MessageSendType = 'SMS' | 'MAIL' | 'WECHAT' | 'DINGTALK' | 'SUPERAPP' | 'WEBSITE';
+
+export interface MessageSendRequest {
+  sendId?: string;
+  sendType?: MessageSendType[];
+  messageTypeCode?: string;
+  promise?: boolean;
+  importantIdentity?: boolean;
+  signOff?: string;
+  toPersons?: string;
+  toDepts?: string;
+  toGroups?: string;
+  toPhones?: string;
+  toEmails?: string;
+  data: {
+    handleKey?: string;
+    coverImageUrl?: string;
+    mobileUrl?: string;
+    title: string;
+    paramValueJson?: Record<string, unknown>;
+    filesUrl?: string;
+    url?: string;
   };
 }

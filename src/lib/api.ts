@@ -1,8 +1,9 @@
-import type {
+﻿import type {
   BatchCreateRequest,
   BatchCreateResponse,
   CandidateListResponse,
   CandidateSearchResponse,
+  CandidateReminderResponse,
   DashboardResponse,
   LoginRoleOption,
   ReviewTask,
@@ -44,6 +45,7 @@ import type {
   AuthLoginResponse,
   AuthMeResponse,
   AuthLogoutResponse,
+  MessageSendRequest,
 } from '@/src/types';
 
 async function requestJson<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
@@ -106,6 +108,20 @@ export function submitReview(studentId: string, payload: ReviewActionRequest) {
   return requestJson<ReviewActionResponse>(`/api/candidates/${studentId}/review`, {
     method: 'POST',
     body: JSON.stringify(payload),
+  });
+}
+
+export function remindCandidate(studentId: string, month: string) {
+  return requestJson<CandidateReminderResponse>(`/api/candidates/${encodeURIComponent(studentId)}/remind`, {
+    method: 'POST',
+    body: JSON.stringify({ month }),
+  });
+}
+
+export function remindAllCandidates(month: string) {
+  return requestJson<CandidateReminderResponse>('/api/candidates/remind-all', {
+    method: 'POST',
+    body: JSON.stringify({ month }),
   });
 }
 
@@ -318,3 +334,11 @@ export function deleteDictionaryType(dictType: string) {
     method: 'DELETE',
   });
 }
+
+export function sendMessage(payload: MessageSendRequest) {
+  return requestJson<{ message: string; data: unknown }>('/api/messages/send', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+

@@ -52,6 +52,13 @@ export default function StudentDetail() {
     if (!detail) return [];
     return [...detail.transactions].sort((a, b) => String(b.time).localeCompare(String(a.time)));
   }, [detail]);
+  const fallbackBackPath = React.useMemo(() => {
+    const month = detail?.month ?? searchParams.get('month') ?? '';
+    return month ? `/candidates?month=${encodeURIComponent(month)}` : '/candidates';
+  }, [detail?.month, searchParams]);
+  const handleBack = React.useCallback(() => {
+    navigate(fallbackBackPath, { replace: true });
+  }, [fallbackBackPath, navigate]);
 
   React.useEffect(() => {
     if (!studentId) {
@@ -159,7 +166,7 @@ export default function StudentDetail() {
     <div className="space-y-6">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
         <div className="flex items-start gap-3">
-          <Button variant="outline" size="icon" className="mt-1 h-9 w-9" onClick={() => navigate(-1)}>
+          <Button variant="outline" size="icon" className="mt-1 h-9 w-9" onClick={handleBack}>
             <ArrowLeft size={16} />
           </Button>
           <div>

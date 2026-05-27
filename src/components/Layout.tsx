@@ -79,13 +79,14 @@ export default function Layout({ children }: LayoutProps) {
         if (cancelled) return;
         setMe(null);
         setAuthChecked(true);
-        navigate('/login', { replace: true });
+        const redirect = `${location.pathname}${location.search}`;
+        navigate(`/login?redirect=${encodeURIComponent(redirect)}`, { replace: true });
       });
 
     return () => {
       cancelled = true;
     };
-  }, [isAuthPage, navigate]);
+  }, [isAuthPage, location.pathname, location.search, navigate]);
 
   React.useEffect(() => {
     const keyword = searchText.trim();

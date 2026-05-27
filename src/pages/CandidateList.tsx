@@ -1,11 +1,11 @@
 ﻿import React from 'react';
-import { Eye } from 'lucide-react';
+import { Bell, Eye } from 'lucide-react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { fetchBatches, fetchCandidateColleges, fetchCandidateList, fetchMe, lookupCounselors } from '@/src/lib/api';
+import { fetchBatches, fetchCandidateColleges, fetchCandidateList, fetchMe, lookupCounselors, remindAllCandidates, remindCandidate } from '@/src/lib/api';
 import type { BatchSummary, CandidateListItem, CounselorLookupItem, UserRole } from '@/src/types';
 
 function previousMonthKey(baseDate = new Date()) {
@@ -58,12 +58,26 @@ export default function CandidateList() {
   const [counselorFilter, setCounselorFilter] = React.useState('');
   const [counselorSuggestions, setCounselorSuggestions] = React.useState<CounselorLookupItem[]>([]);
   const [showCounselorSuggestions, setShowCounselorSuggestions] = React.useState(false);
+  const [sendingAllReminder, setSendingAllReminder] = React.useState(false);
+  const [sendingReminderStudentId, setSendingReminderStudentId] = React.useState<string | null>(null);
+  const [actionMessage, setActionMessage] = React.useState<string | null>(null);
   const canUseAdvancedFilters = role === 'admin' || role === 'student_affairs';
+  const [canFundingOfficeReview, setCanFundingOfficeReview] = React.useState(false);
+  const [canFinalReview, setCanFinalReview] = React.useState(false);
+  const canSendReminder = role === 'admin' || (role === 'student_affairs' && (canFundingOfficeReview || canFinalReview));
 
   React.useEffect(() => {
     fetchMe()
-      .then((payload) => setRole(payload.data.user.role))
-      .catch(() => setRole(null));
+      .then((payload) => {
+        setRole(payload.data.user.role);
+        setCanFundingOfficeReview(Boolean(payload.data.user.canFundingOfficeReview));
+        setCanFinalReview(payload.data.user.canFinalReview !== false);
+      })
+      .catch(() => {
+        setRole(null);
+        setCanFundingOfficeReview(false);
+        setCanFinalReview(false);
+      });
   }, []);
 
   React.useEffect(() => {
@@ -170,6 +184,32 @@ export default function CandidateList() {
 
   const handlePrev = () => setPage((p) => Math.max(1, p - 1));
   const handleNext = () => setPage((p) => Math.min(totalPages, p + 1));
+  const handleRemindAll = async () => {
+    setSendingAllReminder(true);
+    setError(null);
+    setActionMessage(null);
+    try {
+      const result = await remindAllCandidates(month);
+      setActionMessage(`${result.message}（共 ${result.data.total} 人）`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '批量发送提醒失败');
+    } finally {
+      setSendingAllReminder(false);
+    }
+  };
+  const handleRemindOne = async (item: CandidateListItem) => {
+    setSendingReminderStudentId(item.studentId);
+    setError(null);
+    setActionMessage(null);
+    try {
+      const result = await remindCandidate(item.studentId, month);
+      setActionMessage(result.message);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '发送提醒失败');
+    } finally {
+      setSendingReminderStudentId(null);
+    }
+  };
   const monthOptions = React.useMemo(() => {
     const values = batches
       .map((item) => item.month)
@@ -189,6 +229,12 @@ export default function CandidateList() {
           <h1 className="text-2xl font-bold text-slate-900">候选名单管理</h1>
           <p className="text-slate-500">查看并管理指定月份的候选名单。</p>
         </div>
+        {canSendReminder ? (
+          <Button className="gap-2 bg-blue-600 hover:bg-blue-700" onClick={() => void handleRemindAll()} disabled={sendingAllReminder || isLoading}>
+            <Bell size={16} />
+            {sendingAllReminder ? '发送中..' : '一键推送审核提醒'}
+          </Button>
+        ) : null}
       </div>
 
       <Card className="border-none shadow-sm">
@@ -274,6 +320,9 @@ export default function CandidateList() {
           {error ? (
             <div className="rounded-lg border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>
           ) : null}
+          {actionMessage ? (
+            <div className="rounded-lg border border-blue-100 bg-blue-50 px-4 py-3 text-sm text-blue-700">{actionMessage}</div>
+          ) : null}
 
           <div className="overflow-hidden rounded-lg border border-slate-100">
             <Table>
@@ -291,7 +340,7 @@ export default function CandidateList() {
                   <TableHead className="w-[90px]">午晚餐天数</TableHead>
                   <TableHead className="w-[120px]">总补助</TableHead>
                   <TableHead className="w-[140px]">状态</TableHead>
-                  <TableHead className="w-[90px] text-right">操作</TableHead>
+                  <TableHead className="w-[220px] text-right">操作</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -323,11 +372,25 @@ export default function CandidateList() {
                       <TableCell>¥ {item.subsidyEstimate.toFixed(2)}</TableCell>
                       <TableCell>{getStatusBadge(item.workflowStatusLabel, item.workflowStatus)}</TableCell>
                       <TableCell className="text-right">
-                        <Button asChild variant="ghost" size="sm" className="h-8 px-2">
-                          <Link to={`/students/${item.studentId}?month=${encodeURIComponent(item.month)}`} title="查看详情">
-                            <Eye size={16} />
-                          </Link>
-                        </Button>
+                        <div className="flex items-center justify-end gap-1">
+                          {canSendReminder ? (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-8 px-2"
+                              onClick={() => void handleRemindOne(item)}
+                              disabled={sendingReminderStudentId === item.studentId}
+                            >
+                              <Bell size={14} />
+                              {sendingReminderStudentId === item.studentId ? '发送中..' : '提醒'}
+                            </Button>
+                          ) : null}
+                          <Button asChild variant="ghost" size="sm" className="h-8 px-2">
+                            <Link to={`/students/${item.studentId}?month=${encodeURIComponent(item.month)}`} title="查看详情">
+                              <Eye size={16} />
+                            </Link>
+                          </Button>
+                        </div>
                       </TableCell>
                     </TableRow>
                   ))

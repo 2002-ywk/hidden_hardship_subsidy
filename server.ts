@@ -8,6 +8,7 @@ import net from "node:net";
 import { createServer as createViteServer } from "vite";
 import { candidateRepository } from "./src/server/repositories/candidateRepository";
 import { dataSyncRepository } from "./src/server/repositories/dataSyncRepository";
+import { messageCenterClient } from "./src/server/repositories/messageCenterClient";
 import { referenceDataRepository } from "./src/server/repositories/referenceDataRepository";
 import { prisma } from "./src/server/db/client";
 import type {
@@ -19,6 +20,8 @@ import type {
   DictionarySaveRequest,
   DictionaryTypeUpsertRequest,
   ReviewActionRequest,
+  CandidateReminderResponse,
+  MessageSendRequest,
   SyncRunRequest,
   SyncTerminateResponse,
   SystemConfigUpdateRequest,
@@ -89,9 +92,11 @@ async function startServer() {
   type OAuthSession = {
     state: string;
     role?: string;
+    redirect?: string;
   };
   type OAuthStateCacheRecord = {
     role: string;
+    redirect?: string;
     expiresAt: number;
   };
   type SessionTokens = {
@@ -137,9 +142,9 @@ async function startServer() {
       if (record.expiresAt <= now) oauthStateCache.delete(key);
     }
   };
-  const setCachedOAuthState = (state: string, role: string) => {
+  const setCachedOAuthState = (state: string, role: string, redirect?: string) => {
     pruneExpiredOAuthState();
-    oauthStateCache.set(state, { role, expiresAt: Date.now() + OAUTH_STATE_TTL_MS });
+    oauthStateCache.set(state, { role, redirect, expiresAt: Date.now() + OAUTH_STATE_TTL_MS });
   };
   const consumeCachedOAuthState = (state: string) => {
     const record = oauthStateCache.get(state);
@@ -256,6 +261,301 @@ async function startServer() {
       next();
     };
   };
+  const shouldAutoSendReviewMessage = String(process.env.MESSAGE_PLATFORM_AUTO_SEND_REVIEW ?? "0").trim() === "1";
+  const reviewMessageTestReceiver = String(process.env.MESSAGE_PLATFORM_REVIEW_TEST_RECEIVER ?? "202461000059").trim();
+  const candidateReminderTestReceiver = String(process.env.MESSAGE_PLATFORM_CANDIDATE_REMINDER_TEST_RECEIVER ?? "").trim();
+  const enableAutoCandidateReminder = String(process.env.MESSAGE_PLATFORM_AUTO_CANDIDATE_REMINDER ?? "1").trim() === "1";
+  const autoCandidateReminderIntervalMsRaw = Number(process.env.MESSAGE_PLATFORM_AUTO_CANDIDATE_REMINDER_INTERVAL_MS ?? "600000");
+  const autoCandidateReminderIntervalMs = Number.isFinite(autoCandidateReminderIntervalMsRaw)
+    ? Math.max(60_000, Math.floor(autoCandidateReminderIntervalMsRaw))
+    : 600_000;
+  const appBaseUrl = String(process.env.APP_URL ?? "http://127.0.0.1:3000").trim().replace(/\/+$/, "");
+  const normalizeReceivers = (values: Array<string | null | undefined>) =>
+    Array.from(
+      new Set(
+        values
+          .map((item) => String(item ?? "").trim())
+          .filter(Boolean)
+      )
+    );
+  const resolveCandidateReminderReceivers = async (studentNo: string, month: string) => {
+    if (candidateReminderTestReceiver) return [candidateReminderTestReceiver];
+    const candidate = await prisma.candidateResult.findFirst({
+      where: {
+        month,
+        student: {
+          studentId: studentNo,
+        },
+      },
+      include: {
+        student: {
+          include: {
+            relations: {
+              include: {
+                counselor: {
+                  select: {
+                    employeeNo: true,
+                    account: true,
+                  },
+                },
+              },
+              orderBy: {
+                createdAt: "desc",
+              },
+              take: 1,
+            },
+          },
+        },
+      },
+      orderBy: {
+        month: "desc",
+      },
+    });
+    if (!candidate) return [];
+    if (candidate.currentStage === "counselor") {
+      const counselor = candidate.student.relations[0]?.counselor;
+      return normalizeReceivers([counselor?.employeeNo, counselor?.account]);
+    }
+    if (candidate.currentStage === "college") {
+      const college = String(candidate.student.departmentName ?? "").trim();
+      if (!college) return [];
+      const rows = await prisma.$queryRawUnsafe<Array<{ employeeNo: string | null; account: string | null }>>(
+        `
+        SELECT u.employeeNo, u.account
+        FROM audit_reviewer_assignment a
+        INNER JOIN User u ON u.id = a.userId
+        WHERE a.stage = 'college'
+          AND a.status = 'active'
+          AND a.college = ?
+        ORDER BY u.employeeNo ASC
+        `,
+        college
+      );
+      return normalizeReceivers(rows.flatMap((item) => [item.employeeNo, item.account]));
+    }
+    if (candidate.currentStage === "funding_office" || candidate.currentStage === "student_affairs") {
+      const stage = candidate.currentStage === "funding_office" ? "funding_office" : "student_affairs";
+      const rows = await prisma.$queryRawUnsafe<Array<{ employeeNo: string | null; account: string | null }>>(
+        `
+        SELECT u.employeeNo, u.account
+        FROM audit_reviewer_assignment a
+        INNER JOIN User u ON u.id = a.userId
+        WHERE a.stage = ?
+          AND a.status = 'active'
+        ORDER BY u.employeeNo ASC
+        `,
+        stage
+      );
+      return normalizeReceivers(rows.flatMap((item) => [item.employeeNo, item.account]));
+    }
+    return [];
+  };
+  const canSendCandidateReminder = (user?: SessionUser | null) => {
+    if (!user) return false;
+    if (user.role === "admin") return true;
+    if (user.role !== "student_affairs") return false;
+    return Boolean(user.canFundingOfficeReview) || user.canFinalReview !== false;
+  };
+  const reminderLockKey = "candidate_auto_reminder_lock";
+  const initialReminderTag = "auto_reminder_day3";
+  const overdueReminderTag = "auto_reminder_overdue";
+  const toDateText = (value: Date) =>
+    `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
+  const calcDayDiff = (from: Date, to: Date) => {
+    const start = new Date(from.getFullYear(), from.getMonth(), from.getDate()).getTime();
+    const end = new Date(to.getFullYear(), to.getMonth(), to.getDate()).getTime();
+    return Math.floor((end - start) / (24 * 60 * 60 * 1000));
+  };
+  const sendCandidateReminderByItem = async (item: {
+    studentId: string;
+    name: string;
+    month: string;
+    workflowStatus: string;
+    workflowStatusLabel: string;
+  }, mode: "initial" | "overdue") => {
+    const receivers = await resolveCandidateReminderReceivers(item.studentId, item.month);
+    if (receivers.length === 0) {
+      throw new Error("未找到当前审核阶段对应的审核人");
+    }
+    const toPersons = receivers.join(",");
+    const studentDetailUrl = `${appBaseUrl}/students/${encodeURIComponent(item.studentId)}?month=${encodeURIComponent(item.month)}`;
+    const content =
+      mode === "overdue"
+        ? `【逾期提醒】${item.name}同学（学号：${item.studentId}）在${item.month}批次的饮食补助申请已逾期，当前环节“${item.workflowStatusLabel}”仍未完成，请尽快处理。`
+        : `【审核提醒】${item.name}同学（学号：${item.studentId}）在${item.month}批次的饮食补助申请当前处于“${item.workflowStatusLabel}”环节，请及时登录系统处理。`;
+    await messageCenterClient.sendMessage({
+      toPersons,
+      sendType: ["WEBSITE", "SUPERAPP"],
+      data: {
+        title: "饮食补助审核提醒",
+        url: studentDetailUrl,
+        mobileUrl: studentDetailUrl,
+        paramValueJson: {
+          content,
+        },
+      },
+    });
+  };
+  const runAutoCandidateReminder = async () => {
+    if (!enableAutoCandidateReminder) return;
+    const lockId = "candidate-auto-reminder";
+    const now = new Date();
+    const pendingStatuses = new Set([
+      "pending_counselor",
+      "pending_college",
+      "pending_funding_office",
+      "pending_final",
+      "counselor_overdue",
+      "college_overdue",
+      "funding_office_overdue",
+      "final_overdue",
+    ]);
+    try {
+      const lock = await prisma.syncJob.upsert({
+        where: { id: lockId },
+        create: {
+          id: lockId,
+          name: "候选人自动提醒任务",
+          source: reminderLockKey,
+          jobType: "system",
+          status: "running",
+          note: "",
+          startedAt: now,
+          lastRunAt: now,
+        },
+        update: {},
+      });
+      if (lock.status === "running" && lock.startedAt && now.getTime() - lock.startedAt.getTime() < 10 * 60 * 1000) {
+        return;
+      }
+      await prisma.syncJob.update({
+        where: { id: lockId },
+        data: { status: "running", startedAt: now, lastRunAt: now },
+      });
+      const candidates = await prisma.candidateListSnapshot.findMany({
+        where: {
+          workflowStatus: { in: Array.from(pendingStatuses) },
+        },
+        select: {
+          studentId: true,
+          name: true,
+          month: true,
+          workflowStatus: true,
+          workflowStatusLabel: true,
+          createdAt: true,
+        },
+      });
+      const historyRows = await prisma.$queryRawUnsafe<Array<{ content: string }>>(
+        `
+        SELECT content
+        FROM operation_log
+        WHERE targetType = 'candidate_reminder'
+          AND action IN (?, ?)
+          AND createdAt >= DATE_SUB(NOW(), INTERVAL 90 DAY)
+        `,
+        initialReminderTag,
+        overdueReminderTag
+      );
+      const sentSet = new Set(historyRows.map((item) => String(item.content ?? "").trim()).filter(Boolean));
+      let success = 0;
+      let failed = 0;
+      for (const item of candidates) {
+        const dayDiff = calcDayDiff(item.createdAt, now);
+        const isOverdue = item.workflowStatus.includes("overdue");
+        const sendInitial = dayDiff >= 3 && !isOverdue;
+        const sendOverdue = isOverdue;
+        if (!sendInitial && !sendOverdue) continue;
+        const mode: "initial" | "overdue" = sendOverdue ? "overdue" : "initial";
+        const action = mode === "overdue" ? overdueReminderTag : initialReminderTag;
+        const key = `${action}:${item.month}:${item.studentId}:${toDateText(now)}`;
+        if (sentSet.has(key)) continue;
+        try {
+          await sendCandidateReminderByItem(item, mode);
+          await prisma.operationLog.create({
+            data: {
+              id: `op-${action}-${item.studentId}-${Date.now()}`,
+              targetType: "candidate_reminder",
+              targetId: `${item.month}:${item.studentId}`,
+              action,
+              content: key,
+              operatorRole: "system",
+            },
+          });
+          sentSet.add(key);
+          success += 1;
+        } catch (error) {
+          failed += 1;
+          await prisma.operationLog.create({
+            data: {
+              id: `op-${action}-failed-${item.studentId}-${Date.now()}`,
+              targetType: "candidate_reminder",
+              targetId: `${item.month}:${item.studentId}`,
+              action: `${action}_failed`,
+              content: `${key}|${error instanceof Error ? error.message : "unknown error"}`,
+              operatorRole: "system",
+            },
+          });
+        }
+      }
+      await prisma.syncJob.update({
+        where: { id: lockId },
+        data: {
+          status: "success",
+          delta: `${success}`,
+          note: `自动提醒执行完成：成功 ${success}，失败 ${failed}`,
+          finishedAt: new Date(),
+          lastRunAt: new Date(),
+        },
+      });
+    } catch (error) {
+      await prisma.syncJob
+        .update({
+          where: { id: lockId },
+          data: {
+            status: "failed",
+            note: `自动提醒执行失败：${error instanceof Error ? error.message : "unknown error"}`,
+            finishedAt: new Date(),
+            lastRunAt: new Date(),
+          },
+        })
+        .catch(() => undefined);
+    }
+  };
+  const sendReviewMessageIfEnabled = async (params: {
+    studentId?: string;
+    studentName?: string;
+    month?: string;
+    stage?: string;
+    decision?: string;
+    comment?: string;
+  }) => {
+    if (!shouldAutoSendReviewMessage) return;
+    const toPersons = reviewMessageTestReceiver || String(params.studentId ?? "").trim();
+    if (!toPersons) return;
+    const stageLabelMap: Record<string, string> = {
+      counselor: "辅导员审核",
+      college: "学院审核",
+      funding_office: "资助中心审核",
+      student_affairs: "学工审核",
+    };
+    const decisionLabel = params.decision === "approve" ? "通过" : params.decision === "reject" ? "驳回" : "处理";
+    const stageLabel = stageLabelMap[String(params.stage ?? "")] ?? String(params.stage ?? "审核");
+    const month = String(params.month ?? "").trim();
+    const title = "困难补助审核结果通知";
+    const content = `${params.studentName ?? ""}同学，您在${month || "当前批次"}的申请已由${stageLabel}${decisionLabel}。`;
+    const comment = String(params.comment ?? "").trim();
+
+    await messageCenterClient.sendMessage({
+      sendType: ["WEBSITE", "SUPERAPP"],
+      toPersons,
+      data: {
+        title,
+        paramValueJson: {
+          content: comment ? `${content} 备注：${comment}` : content,
+        },
+      },
+    });
+  };
 
   // Mock API is served by the same Express app to keep frontend and backend integrated.
   app.get("/api/health/db", async (req, res) => {
@@ -318,8 +618,10 @@ async function startServer() {
     }
     const state = createSignedOAuthState();
     const role = typeof req.query.role === "string" ? req.query.role : "";
-    setOAuthSession(req, { state, role: role || "counselor" });
-    setCachedOAuthState(state, role || "counselor");
+    const redirect = typeof req.query.redirect === "string" ? req.query.redirect : "";
+    const safeRedirect = redirect.startsWith("/") ? redirect : "/";
+    setOAuthSession(req, { state, role: role || "counselor", redirect: safeRedirect });
+    setCachedOAuthState(state, role || "counselor", safeRedirect);
 
     const authorizeUrl = new URL(oauthAuthorizeUrl);
     const reauth = String(req.query.reauth ?? "").trim();
@@ -641,8 +943,12 @@ async function startServer() {
         canFundingOfficeReview,
         canFinalReview,
       });
+      const redirectTarget =
+        String(cachedState?.redirect ?? oauthSession?.redirect ?? "").trim().startsWith("/")
+          ? String(cachedState?.redirect ?? oauthSession?.redirect ?? "").trim()
+          : "/";
       clearOAuthSession(req);
-      res.redirect("/");
+      res.redirect(redirectTarget || "/");
     } catch (error) {
       const message = error instanceof Error ? error.message : "OAuth callback failed";
       res.status(500).send(message);
@@ -763,7 +1069,7 @@ async function startServer() {
       const result = await dataSyncRepository.runSync(payload);
       res.json(result);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "鍚屾澶辫触";
+      const message = error instanceof Error ? error.message : "同步失败";
       res.status(400).json({ message });
     }
   });
@@ -778,7 +1084,7 @@ async function startServer() {
       };
       res.json(payload);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "缁堟浠诲姟澶辫触";
+      const message = error instanceof Error ? error.message : "终止任务失败";
       res.status(400).json({ message });
     }
   });
@@ -791,8 +1097,71 @@ async function startServer() {
         data: result,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : "缁堟鍏ㄩ儴浠诲姟澶辫触";
+      const message = error instanceof Error ? error.message : "终止全部任务失败";
       res.status(400).json({ message });
+    }
+  });
+
+  app.post("/api/messages/send", requireRoles(["admin", "student_affairs"]), async (req, res) => {
+    try {
+      const payload = (req.body ?? {}) as MessageSendRequest;
+      const title = String(payload?.data?.title ?? "").trim();
+      if (!title) {
+        res.status(400).json({ message: "data.title is required" });
+        return;
+      }
+      const hasReceiver =
+        Boolean(String(payload.toPersons ?? "").trim()) ||
+        Boolean(String(payload.toDepts ?? "").trim()) ||
+        Boolean(String(payload.toGroups ?? "").trim()) ||
+        Boolean(String(payload.toPhones ?? "").trim()) ||
+        Boolean(String(payload.toEmails ?? "").trim());
+      if (!hasReceiver) {
+        res.status(400).json({ message: "至少需要提供一个接收方：toPersons/toDepts/toGroups/toPhones/toEmails" });
+        return;
+      }
+
+      const result = await messageCenterClient.sendMessage(payload);
+      res.json({
+        message: "消息已提交发送",
+        data: result,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "message send failed";
+      res.status(400).json({ message });
+    }
+  });
+
+  app.get("/api/messages/health", requireRoles(["admin", "student_affairs"]), async (_req, res) => {
+    const config = messageCenterClient.getRuntimeConfigSummary();
+    if (!config.hasCredentials) {
+      res.status(400).json({
+        ok: false,
+        message: "消息平台凭据未配置，请设置 MESSAGE_PLATFORM_CLIENT_ID / MESSAGE_PLATFORM_CLIENT_SECRET",
+        config,
+      });
+      return;
+    }
+
+    try {
+      const token = await messageCenterClient.getAccessToken();
+      res.json({
+        ok: true,
+        message: "消息平台连通性正常（token 获取成功）",
+        config,
+        token: {
+          acquired: Boolean(token),
+          preview: `${token.slice(0, 8)}...`,
+          length: token.length,
+        },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "消息平台健康检查失败";
+      res.status(502).json({
+        ok: false,
+        message,
+        config,
+      });
     }
   });
 
@@ -1179,8 +1548,136 @@ async function startServer() {
         message: `${updated.name} 已完成${payload.decision === "approve" ? "通过" : "驳回"}处理`,
         data: updated,
       });
+      void sendReviewMessageIfEnabled({
+        studentId: updated.studentId,
+        studentName: updated.name,
+        month: payload.month,
+        stage: payload.stage,
+        decision: payload.decision,
+        comment: payload.comment,
+      }).catch((notifyError) => {
+        console.error("review message send failed:", notifyError);
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : "review failed";
+      res.status(400).json({ message });
+    }
+  });
+
+  app.post("/api/candidates/:studentId/remind", async (req, res) => {
+    try {
+      const user = getSessionUser(req);
+      if (!canSendCandidateReminder(user)) {
+        res.status(403).json({ message: "无权限发送审核提醒" });
+        return;
+      }
+      const month = String((req.body as { month?: string } | undefined)?.month ?? "").trim();
+      if (!month) {
+        res.status(400).json({ message: "month is required" });
+        return;
+      }
+      const detail = await candidateRepository.getStudentDetail(req.params.studentId, month, user);
+      if (!detail) {
+        res.status(404).json({ message: "candidate not found" });
+        return;
+      }
+      if (detail.workflowStatus === "included") {
+        res.status(400).json({ message: "该候选人已纳入发放名单，无需发送审核提醒" });
+        return;
+      }
+      const receivers = await resolveCandidateReminderReceivers(detail.studentId, month);
+      if (receivers.length === 0) {
+        res.status(400).json({ message: "未找到当前审核阶段对应的审核人，无法发送提醒" });
+        return;
+      }
+      const toPersons = receivers.join(",");
+      await sendCandidateReminderByItem(
+        {
+          studentId: detail.studentId,
+          name: detail.name,
+          month,
+          workflowStatus: detail.workflowStatus,
+          workflowStatusLabel: detail.workflowStatusLabel,
+        },
+        "initial"
+      );
+      const payload: CandidateReminderResponse = {
+        message: `${detail.name} 审核提醒已发送（接收人：${toPersons}）`,
+        data: {
+          total: 1,
+          success: 1,
+          failed: 0,
+          failedItems: [],
+        },
+      };
+      res.json(payload);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "candidate remind failed";
+      res.status(400).json({ message });
+    }
+  });
+
+  app.post("/api/candidates/remind-all", async (req, res) => {
+    try {
+      const user = getSessionUser(req);
+      if (!canSendCandidateReminder(user)) {
+        res.status(403).json({ message: "无权限发送审核提醒" });
+        return;
+      }
+      const month = String((req.body as { month?: string } | undefined)?.month ?? "").trim();
+      if (!month) {
+        res.status(400).json({ message: "month is required" });
+        return;
+      }
+      const snapshot = await candidateRepository.getCandidateSnapshot(month, 1, 5000, user);
+      const pendingStatuses = new Set([
+        "pending_counselor",
+        "pending_college",
+        "pending_funding_office",
+        "pending_final",
+        "counselor_overdue",
+        "college_overdue",
+        "funding_office_overdue",
+        "final_overdue",
+      ]);
+      const targets = snapshot.items.filter((item) => item.workflowStatus !== "included" && pendingStatuses.has(item.workflowStatus));
+      const failedItems: Array<{ studentId: string; reason: string }> = [];
+      let success = 0;
+      for (const item of targets) {
+        try {
+          const receivers = await resolveCandidateReminderReceivers(item.studentId, month);
+          if (receivers.length === 0) {
+            failedItems.push({ studentId: item.studentId, reason: "未找到当前审核阶段对应的审核人" });
+            continue;
+          }
+          await sendCandidateReminderByItem(
+            {
+              studentId: item.studentId,
+              name: item.name,
+              month: item.month,
+              workflowStatus: item.workflowStatus,
+              workflowStatusLabel: item.workflowStatusLabel,
+            },
+            "initial"
+          );
+          success += 1;
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : "unknown error";
+          failedItems.push({ studentId: item.studentId, reason });
+        }
+      }
+      const payload: CandidateReminderResponse = {
+        message: `审核提醒发送完成：成功 ${success}，失败 ${failedItems.length}`,
+        data: {
+          total: targets.length,
+          success,
+          failed: failedItems.length,
+          failedItems,
+        },
+      };
+      res.json(payload);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "candidate remind all failed";
       res.status(400).json({ message });
     }
   });
@@ -1271,6 +1768,14 @@ async function startServer() {
   const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
+  if (enableAutoCandidateReminder) {
+    setTimeout(() => {
+      void runAutoCandidateReminder();
+    }, 5000);
+    setInterval(() => {
+      void runAutoCandidateReminder();
+    }, autoCandidateReminderIntervalMs);
+  }
 
   server.on("error", (error: unknown) => {
     const err = error as { code?: string; message?: string };
@@ -1288,5 +1793,7 @@ async function startServer() {
 
 loadEnvironment();
 startServer();
+
+
 
 

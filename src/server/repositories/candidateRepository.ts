@@ -715,6 +715,41 @@ export class CandidateRepository {
       ),
     ]);
     const totalCount = Number(total[0]?.total ?? 0);
+    const pageStudentNos = Array.from(new Set(rows.map((item) => String(item.studentId ?? '').trim()).filter(Boolean)));
+    const resolvedDaysByStudentNo = new Map<string, { breakfastDaysCount: number; lunchDinnerDaysCount: number }>();
+    const actualTransactionTableName = await this.resolveActualTransactionTableName(month);
+    if (actualTransactionTableName && pageStudentNos.length > 0) {
+      const placeholders = pageStudentNos.map(() => '?').join(', ');
+      const dayRows = await prisma.$queryRawUnsafe<
+        Array<{ studentNo: string; breakfastDaysCount: unknown; lunchDinnerDaysCount: unknown }>
+      >(
+        `
+          SELECT
+            ct.studentNo,
+            COUNT(DISTINCT CASE WHEN ct.mealSlot = 'breakfast' THEN DATE(ct.occurredAt) END) AS breakfastDaysCount,
+            COUNT(
+              DISTINCT CASE
+                WHEN ct.mealSlot = 'lunch'
+                  OR ct.mealSlot IN ('dinner', 'night', 'night_snack', 'supper', 'late_night')
+                  OR ct.mealSlot = 'lunch_dinner'
+                THEN DATE(ct.occurredAt)
+              END
+            ) AS lunchDinnerDaysCount
+          FROM \`${actualTransactionTableName}\` ct
+          WHERE ct.amount > 0
+            AND ct.mealSlot IN ('breakfast', 'lunch', 'dinner', 'lunch_dinner', 'night', 'night_snack', 'supper', 'late_night')
+            AND ct.studentNo IN (${placeholders})
+          GROUP BY ct.studentNo
+        `,
+        ...pageStudentNos
+      );
+      for (const row of dayRows) {
+        resolvedDaysByStudentNo.set(String(row.studentNo), {
+          breakfastDaysCount: Math.max(0, Math.floor(safeNumber(row.breakfastDaysCount))),
+          lunchDinnerDaysCount: Math.max(0, Math.floor(safeNumber(row.lunchDinnerDaysCount))),
+        });
+      }
+    }
 
     const missingCounselorStudentNos = rows
       .filter((item) => !item.counselor || item.counselor.trim() === '-')
@@ -775,8 +810,8 @@ export class CandidateRepository {
       typeLabel: item.typeLabel,
       averageSpendLabel: item.averageSpendLabel || '-',
       daysCount: item.daysCount,
-      breakfastDaysCount: Math.max(0, Number(item.breakfastDaysCount ?? 0)),
-      lunchDinnerDaysCount: Math.max(0, Number(item.lunchDinnerDaysCount ?? 0)),
+      breakfastDaysCount: resolvedDaysByStudentNo.get(item.studentId)?.breakfastDaysCount ?? Math.max(0, Number(item.breakfastDaysCount ?? 0)),
+      lunchDinnerDaysCount: resolvedDaysByStudentNo.get(item.studentId)?.lunchDinnerDaysCount ?? Math.max(0, Number(item.lunchDinnerDaysCount ?? 0)),
       workflowStatus: item.workflowStatus as never,
       workflowStatusLabel: normalizeMojibakeText(item.workflowStatusLabel),
       tags: parseJsonArray(item.tagsJson).map((tag) => normalizeMojibakeText(tag)),
