@@ -262,6 +262,7 @@ async function startServer() {
     };
   };
   const shouldAutoSendReviewMessage = String(process.env.MESSAGE_PLATFORM_AUTO_SEND_REVIEW ?? "0").trim() === "1";
+  const shouldAutoSendNextStageReminder = String(process.env.MESSAGE_PLATFORM_AUTO_SEND_NEXT_STAGE_REMINDER ?? "1").trim() === "1";
   const reviewMessageTestReceiver = String(process.env.MESSAGE_PLATFORM_REVIEW_TEST_RECEIVER ?? "202461000059").trim();
   const candidateReminderTestReceiver = String(process.env.MESSAGE_PLATFORM_CANDIDATE_REMINDER_TEST_RECEIVER ?? "").trim();
   const enableAutoCandidateReminder = String(process.env.MESSAGE_PLATFORM_AUTO_CANDIDATE_REMINDER ?? "1").trim() === "1";
@@ -395,6 +396,27 @@ async function startServer() {
         },
       },
     });
+  };
+  const sendNextStageReminderIfNeeded = async (item: {
+    studentId: string;
+    name: string;
+    month: string;
+    workflowStatus: string;
+    workflowStatusLabel: string;
+  }) => {
+    if (!shouldAutoSendNextStageReminder) return;
+    const pendingStatuses = new Set([
+      "pending_counselor",
+      "pending_college",
+      "pending_funding_office",
+      "pending_final",
+      "counselor_overdue",
+      "college_overdue",
+      "funding_office_overdue",
+      "final_overdue",
+    ]);
+    if (!pendingStatuses.has(String(item.workflowStatus ?? ""))) return;
+    await sendCandidateReminderByItem(item, "initial");
   };
   const runAutoCandidateReminder = async () => {
     if (!enableAutoCandidateReminder) return;
@@ -1558,6 +1580,17 @@ async function startServer() {
       }).catch((notifyError) => {
         console.error("review message send failed:", notifyError);
       });
+      if (payload.decision === "approve") {
+        void sendNextStageReminderIfNeeded({
+          studentId: updated.studentId,
+          name: updated.name,
+          month: payload.month,
+          workflowStatus: updated.workflowStatus,
+          workflowStatusLabel: updated.workflowStatusLabel,
+        }).catch((notifyError) => {
+          console.error("next stage reminder send failed:", notifyError);
+        });
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "review failed";
       res.status(400).json({ message });
