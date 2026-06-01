@@ -324,15 +324,33 @@ async function startServer() {
         `
         SELECT u.employeeNo, u.account
         FROM audit_reviewer_assignment a
-        INNER JOIN User u ON u.id = a.userId
+        INNER JOIN User u ON BINARY u.id = BINARY a.userId
         WHERE a.stage = 'college'
           AND a.status = 'active'
-          AND a.college = ?
+          AND a.college COLLATE utf8mb4_unicode_ci = CAST(? AS CHAR) COLLATE utf8mb4_unicode_ci
         ORDER BY u.employeeNo ASC
         `,
         college
       );
-      return normalizeReceivers(rows.flatMap((item) => [item.employeeNo, item.account]));
+      const configuredReceivers = normalizeReceivers(rows.flatMap((item) => [item.employeeNo, item.account]));
+      if (configuredReceivers.length > 0) {
+        return configuredReceivers;
+      }
+      // Keep reminder receiver resolution consistent with role-permission page fallback:
+      // when no explicit reviewer assignment exists, fallback to active college_admin users in this college.
+      const fallbackUsers = await prisma.user.findMany({
+        where: {
+          role: "college_admin",
+          status: "active",
+          college,
+        },
+        select: {
+          employeeNo: true,
+          account: true,
+        },
+        orderBy: [{ employeeNo: "asc" }, { account: "asc" }],
+      });
+      return normalizeReceivers(fallbackUsers.flatMap((item) => [item.employeeNo, item.account]));
     }
     if (candidate.currentStage === "funding_office" || candidate.currentStage === "student_affairs") {
       const stage = candidate.currentStage === "funding_office" ? "funding_office" : "student_affairs";
@@ -340,14 +358,50 @@ async function startServer() {
         `
         SELECT u.employeeNo, u.account
         FROM audit_reviewer_assignment a
-        INNER JOIN User u ON u.id = a.userId
+        INNER JOIN User u ON BINARY u.id = BINARY a.userId
         WHERE a.stage = ?
           AND a.status = 'active'
         ORDER BY u.employeeNo ASC
         `,
         stage
       );
-      return normalizeReceivers(rows.flatMap((item) => [item.employeeNo, item.account]));
+      const configuredReceivers = normalizeReceivers(rows.flatMap((item) => [item.employeeNo, item.account]));
+      if (configuredReceivers.length > 0) {
+        return configuredReceivers;
+      }
+      // Keep reminder receiver resolution consistent with role-permission page fallback.
+      const studentAffairsUsers = await prisma.user.findMany({
+        where: {
+          role: "student_affairs",
+          status: "active",
+        },
+        select: {
+          employeeNo: true,
+          account: true,
+        },
+        orderBy: [{ employeeNo: "asc" }, { account: "asc" }],
+      });
+      const relationRows =
+        stage === "funding_office"
+          ? await prisma.$queryRawUnsafe<Array<{ employeeNo: string | null }>>(
+              `SELECT DISTINCT employeeNo
+                 FROM org_person_relation_sync
+                WHERE BINARY unitCode = BINARY '00000090'`
+            )
+          : await prisma.$queryRawUnsafe<Array<{ employeeNo: string | null }>>(
+              `SELECT DISTINCT employeeNo
+                 FROM org_person_relation_sync
+                WHERE BINARY unitCode = BINARY '00000009'
+                  AND postName LIKE '%部长%'`
+            );
+      const allowedEmployeeNos = new Set(
+        relationRows.map((item) => String(item.employeeNo ?? "").trim()).filter(Boolean)
+      );
+      const fallbackUsers = studentAffairsUsers.filter((item) => {
+        const no = String(item.employeeNo ?? "").trim();
+        return no && allowedEmployeeNos.has(no);
+      });
+      return normalizeReceivers(fallbackUsers.flatMap((item) => [item.employeeNo, item.account]));
     }
     return [];
   };
@@ -1589,6 +1643,16 @@ async function startServer() {
           workflowStatusLabel: updated.workflowStatusLabel,
         }).catch((notifyError) => {
           console.error("next stage reminder send failed:", notifyError);
+          void prisma.operationLog.create({
+            data: {
+              id: `op-next-stage-reminder-failed-${updated.studentId}-${Date.now()}`,
+              targetType: "candidate_reminder",
+              targetId: `${payload.month}:${updated.studentId}`,
+              action: "next_stage_reminder_failed",
+              content: notifyError instanceof Error ? notifyError.message : "unknown error",
+              operatorRole: "system",
+            },
+          }).catch(() => undefined);
         });
       }
     } catch (error) {

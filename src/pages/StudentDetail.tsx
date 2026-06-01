@@ -334,6 +334,7 @@ export default function StudentDetail() {
                 <Table>
                   <TableHeader className="bg-slate-50">
                     <TableRow>
+                      <TableHead className="w-[72px]">序号</TableHead>
                       <TableHead>交易时间</TableHead>
                       <TableHead>消费时段</TableHead>
                       <TableHead>地点</TableHead>
@@ -341,8 +342,9 @@ export default function StudentDetail() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {sortedTransactions.map((item) => (
+                    {sortedTransactions.map((item, index) => (
                       <TableRow key={item.id}>
+                        <TableCell>{index + 1}</TableCell>
                         <TableCell>{item.time}</TableCell>
                         <TableCell>{item.slotLabel}</TableCell>
                         <TableCell>{item.location}</TableCell>

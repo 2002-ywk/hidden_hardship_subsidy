@@ -945,11 +945,7 @@ export class DataSyncRepository {
           const staleIds = existingStudents
             .filter((item) => !incomingByStudentId.has(item.studentId))
             .map((item) => item.id);
-          for (const chunk of chunkArray(staleIds, 1000)) {
-            await prisma.student.deleteMany({
-              where: { id: { in: chunk } },
-            });
-          }
+          await this.deleteStudentsByIds(staleIds);
 
           imported.students = createRows.length + changedRows.length;
         } else {
@@ -1744,6 +1740,43 @@ export class DataSyncRepository {
     }
   }
 
+
+  private async deleteStudentsByIds(studentIds: string[]) {
+    if (studentIds.length === 0) {
+      return 0;
+    }
+    let deleted = 0;
+    for (const chunk of chunkArray(studentIds, 1000)) {
+      await prisma.$transaction([
+        prisma.undergraduateDifficultyRecognition.deleteMany({
+          where: { studentId: { in: chunk } },
+        }),
+        prisma.counselorStudentRelation.deleteMany({
+          where: { studentId: { in: chunk } },
+        }),
+        prisma.studentMonthStat.deleteMany({
+          where: { studentId: { in: chunk } },
+        }),
+        prisma.candidateResult.deleteMany({
+          where: { studentId: { in: chunk } },
+        }),
+        prisma.reviewRecord.deleteMany({
+          where: { studentId: { in: chunk } },
+        }),
+        prisma.tagRecord.deleteMany({
+          where: { studentId: { in: chunk } },
+        }),
+        prisma.finalSubsidyResult.deleteMany({
+          where: { studentId: { in: chunk } },
+        }),
+      ]);
+      const deleteResult = await prisma.student.deleteMany({
+        where: { id: { in: chunk } },
+      });
+      deleted += deleteResult.count;
+    }
+    return deleted;
+  }
   private async syncStudentsStreaming(jobId: string, incrementalCzsj?: string): Promise<{ imported: number; deleted: number }> {
     let pulled = 0;
     let upserted = 0;
@@ -1804,17 +1837,7 @@ export class DataSyncRepository {
       },
     });
     const staleIds = existingRows.filter((item) => !seenStudentIds.has(item.studentId)).map((item) => item.id);
-    let deleted = 0;
-    for (const chunk of chunkArray(staleIds, 1000)) {
-      const deleteResult = await prisma.student.deleteMany({
-        where: {
-          id: {
-            in: chunk,
-          },
-        },
-      });
-      deleted += deleteResult.count;
-    }
+    const deleted = await this.deleteStudentsByIds(staleIds);
     return { imported: upserted, deleted };
   }
 
@@ -2153,3 +2176,5 @@ export class DataSyncRepository {
 }
 
 export const dataSyncRepository = new DataSyncRepository();
+
+

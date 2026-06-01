@@ -1368,6 +1368,8 @@ export class CandidateRepository {
       }
     }
 
+    let subsidyNeedsRefresh = false;
+
     if (candidateCount === 0) {
       const generated = await this.generateCandidatesFromMonthlyTransactions(batch.id, month);
       if (generated > 0) {
@@ -1384,6 +1386,7 @@ export class CandidateRepository {
           },
         });
         await this.rebuildCandidateListSnapshot(month, batch.id);
+        subsidyNeedsRefresh = true;
       } else {
       }
     }
@@ -1411,6 +1414,11 @@ export class CandidateRepository {
     const snapshotCount = await prisma.candidateListSnapshot.count({ where: { month } });
     if (needsSnapshotRebuild || snapshotCount === 0 || snapshotCount !== candidateCount) {
       await this.rebuildCandidateListSnapshot(month, batch.id);
+      subsidyNeedsRefresh = true;
+    }
+
+    if (candidateCount > 0 && subsidyNeedsRefresh) {
+      await this.refreshFinalSubsidyResults(batch.id, month);
     }
 
     const [{ total, items }, pendingCount] = await Promise.all([
@@ -1704,29 +1712,41 @@ export class CandidateRepository {
         continue;
       }
 
-      let matchedRolling3Months = true;
+      // Potential difficulty must satisfy a consistent lane for 3 rolling months:
+      // breakfast lane: breakfast avg <= breakfast bottom10 AND breakfast days >= half month
+      // or lunch/dinner lane: lunch/dinner avg <= lunch/dinner bottom10 AND lunch/dinner days >= half month.
+      let matchedBreakfastLane3Months = true;
+      let matchedLunchDinnerLane3Months = true;
       for (const targetMonth of rollingMonths) {
         const context = monthContexts.get(targetMonth);
         const metric = context?.metricsByStudentNo.get(studentNo);
         if (!context || !metric) {
-          matchedRolling3Months = false;
+          matchedBreakfastLane3Months = false;
+          matchedLunchDinnerLane3Months = false;
           break;
         }
 
         const monthHalfDays = Math.ceil(context.monthDays / 2);
-        const monthMealDayEligible =
-          metric.breakfastDaysCount >= monthHalfDays ||
+        const breakfastLaneMatched =
+          metric.breakfastAvg != null &&
+          context.breakfastBottom10 != null &&
+          metric.breakfastAvg <= context.breakfastBottom10 &&
+          metric.breakfastDaysCount >= monthHalfDays;
+        const lunchDinnerLaneMatched =
+          metric.lunchDinnerAvg != null &&
+          context.lunchDinnerBottom10 != null &&
+          metric.lunchDinnerAvg <= context.lunchDinnerBottom10 &&
           metric.lunchDinnerDaysCount >= monthHalfDays;
-        const potentialCond2 =
-          (metric.breakfastAvg != null && context.breakfastBottom10 != null && metric.breakfastAvg <= context.breakfastBottom10) ||
-          (metric.lunchDinnerAvg != null && context.lunchDinnerBottom10 != null && metric.lunchDinnerAvg <= context.lunchDinnerBottom10);
-        const potentialCond3 = monthMealDayEligible;
 
-        if (!potentialCond2 || !potentialCond3) {
-          matchedRolling3Months = false;
-          break;
+        if (!breakfastLaneMatched) {
+          matchedBreakfastLane3Months = false;
+        }
+        if (!lunchDinnerLaneMatched) {
+          matchedLunchDinnerLane3Months = false;
         }
       }
+
+      const matchedRolling3Months = matchedBreakfastLane3Months || matchedLunchDinnerLane3Months;
 
       if (matchedRolling3Months) {
         candidates.push({

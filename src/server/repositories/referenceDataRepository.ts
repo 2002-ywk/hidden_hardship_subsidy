@@ -1064,7 +1064,7 @@ export class ReferenceDataRepository {
       safe(() => this.countSpecialDifficultyStudents()),
       safe(() => prisma.syncJob.findMany({ orderBy: { lastRunAt: 'desc' }, take: 4 })),
       safe(() => prisma.reviewRecord.findMany({ orderBy: { reviewedAt: 'desc' }, take: 200 })),
-      safe(() => prisma.subsidyBatch.findMany({ orderBy: { month: 'asc' }, take: 4 })),
+      safe(() => prisma.subsidyBatch.findMany({ orderBy: { month: 'desc' }, take: 12 })),
     ]);
     const systemConfig = await safe(() => prisma.systemConfig.findUnique({ where: { id: 1 } }));
     const standardPercentile = Math.min(1, Math.max(0.01, systemConfig?.standardPercentile ?? 0.25));
