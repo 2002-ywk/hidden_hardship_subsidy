@@ -7,7 +7,9 @@ import type {
   DictionaryItemRecord,
   DictionaryListResponse,
   DictionaryTypeRecord,
+  DashboardAnalyticsResponse,
   DashboardResponse,
+  DashboardSummaryResponse,
   LoginRoleOption,
   RolePermissionRecord,
   CollegeAdminListResponse,
@@ -25,6 +27,10 @@ function normalizeSyncSource(source: string) {
   const normalized = (source ?? '').trim();
   if (!normalized) return normalized;
   return normalized.endsWith('_api') ? normalized.slice(0, -4) : normalized;
+}
+
+function isInternalSchedulerSource(source: string) {
+  return String(source ?? '').trim().startsWith('system_');
 }
 
 function normalizeMojibakeText(input: string) {
@@ -102,6 +108,11 @@ type SubsidyStandardSnapshot = {
   computedAt: number;
 };
 
+type DashboardCacheEntry<T> = {
+  expiresAt: number;
+  value: T;
+};
+
 type DashboardContext = {
   id: string;
   role: string;
@@ -111,6 +122,10 @@ type DashboardContext = {
 };
 
 let cachedStandards: SubsidyStandardSnapshot | null = null;
+const dashboardSummaryCache = new Map<string, DashboardCacheEntry<DashboardSummaryResponse>>();
+const dashboardAnalyticsCache = new Map<string, DashboardCacheEntry<DashboardAnalyticsResponse>>();
+const DASHBOARD_SUMMARY_CACHE_TTL_MS = 30 * 1000;
+const DASHBOARD_ANALYTICS_CACHE_TTL_MS = 5 * 60 * 1000;
 
 let defaultDictionaryTypesEnsuredOnce: Promise<void> | null = null;
 let defaultDifficultyDictionaryEnsuredOnce: Promise<void> | null = null;
@@ -198,6 +213,14 @@ function toCurrencyDisplay(value: number) {
   return `¥${roundAmount(value).toFixed(1)}`;
 }
 
+function percentileValue(values: number[], percentile: number) {
+  if (!Array.isArray(values) || values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const p = Math.min(1, Math.max(0, percentile));
+  const index = Math.max(0, Math.min(sorted.length - 1, Math.ceil(sorted.length * p) - 1));
+  return roundAmount(sorted[index] ?? 0);
+}
+
 function studentCollege(value: { departmentName: string }) {
   return value.departmentName || '-';
 }
@@ -244,7 +267,355 @@ function roleLabel(role: string) {
   return '辅导员';
 }
 
+function dashboardContextCacheKey(context?: DashboardContext) {
+  const role = String(context?.role ?? '').trim() || 'anonymous';
+  const id = String(context?.id ?? '').trim() || '-';
+  const college = String(context?.college ?? '').trim() || '-';
+  const canFundingOfficeReview = context?.canFundingOfficeReview ? '1' : '0';
+  const canFinalReview = context?.canFinalReview ? '1' : '0';
+  return [role, id, college, canFundingOfficeReview, canFinalReview].join(':');
+}
+
+function getCachedValue<T>(cache: Map<string, DashboardCacheEntry<T>>, key: string) {
+  const cached = cache.get(key);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    cache.delete(key);
+    return null;
+  }
+  return cached.value;
+}
+
+function setCachedValue<T>(cache: Map<string, DashboardCacheEntry<T>>, key: string, value: T, ttlMs: number) {
+  cache.set(key, {
+    value,
+    expiresAt: Date.now() + ttlMs,
+  });
+}
+
 export class ReferenceDataRepository {
+  private async getDashboardBaseData(context?: DashboardContext) {
+    const safe = <T>(operation: () => Promise<T>) =>
+      retryOnTransientDatabaseConnectionError(operation, { maxRetries: 2, retryDelayMs: 200 });
+
+    const [specialDifficultyStudents, reviewTasks, batches] = await Promise.all([
+      safe(() => this.countSpecialDifficultyStudents()),
+      safe(() => prisma.reviewRecord.findMany({ orderBy: { reviewedAt: 'desc' }, take: 200 })),
+      safe(() => prisma.subsidyBatch.findMany({ orderBy: { month: 'desc' }, take: 12 })),
+    ]);
+    const systemConfig = await safe(() => prisma.systemConfig.findUnique({ where: { id: 1 } }));
+    const standardPercentile = Math.min(1, Math.max(0.01, systemConfig?.standardPercentile ?? 0.25));
+
+    const tableRows = await safe(() =>
+      prisma.$queryRawUnsafe<Array<Record<string, unknown>>>("SHOW TABLES LIKE 'card_transaction_%'")
+    );
+    const tableNames = tableRows
+      .map((row) => Object.values(row)[0])
+      .filter((value): value is string => typeof value === 'string')
+      .sort();
+    const latestTransactionTable = tableNames.at(-1) ?? '';
+    const snapshotMonth = latestTransactionTable ? parseMonthFromTableName(latestTransactionTable) : '';
+
+    let sampleCount = 0;
+    let breakfastStandard = 0;
+    let lunchDinnerStandard = 0;
+    if (snapshotMonth) {
+      const activePlaceholders = ACTIVE_STATUS_CODES.map(() => '?').join(', ');
+      const excludedPlaceholders = EXCLUDED_PERSON_TYPE_CODES.map(() => '?').join(', ');
+      const batch = await safe(() => prisma.subsidyBatch.findUnique({ where: { month: snapshotMonth } }));
+      const batchId = batch?.id ?? null;
+      if (batchId) {
+        await safe(() => this.ensureStudentMonthStats(batchId, snapshotMonth));
+      }
+      const sourceSql = batchId
+        ? `
+        WITH per_student AS (
+          SELECT
+            CASE WHEN sms.breakfastCount > 0 THEN sms.breakfastAvg ELSE NULL END AS breakfastAvg,
+            CASE WHEN sms.lunchDinnerCount > 0 THEN sms.lunchDinnerAvg ELSE NULL END AS lunchDinnerAvg
+          FROM \`StudentMonthStat\` sms
+          WHERE sms.month = ?
+            AND sms.batchId = ?
+        )
+        `
+        : `
+        WITH per_student AS (
+          SELECT
+            ct.studentNo,
+            CASE
+              WHEN COUNT(DISTINCT CASE WHEN ct.mealSlot = 'breakfast' THEN DATE(ct.occurredAt) END) = 0 THEN NULL
+              ELSE SUM(CASE WHEN ct.mealSlot = 'breakfast' THEN ct.amount ELSE 0 END)
+                / COUNT(DISTINCT CASE WHEN ct.mealSlot = 'breakfast' THEN DATE(ct.occurredAt) END)
+            END AS breakfastAvg,
+            CASE
+              WHEN (
+                COUNT(DISTINCT CASE
+                  WHEN ct.mealSlot = 'lunch' OR (ct.mealSlot = 'lunch_dinner' AND HOUR(ct.occurredAt) >= 10 AND HOUR(ct.occurredAt) < 15)
+                  THEN DATE(ct.occurredAt)
+                END)
+                + COUNT(DISTINCT CASE
+                  WHEN ct.mealSlot IN ('dinner', 'night', 'night_snack', 'supper', 'late_night')
+                    OR (ct.mealSlot = 'lunch_dinner' AND NOT (HOUR(ct.occurredAt) >= 10 AND HOUR(ct.occurredAt) < 15))
+                  THEN DATE(ct.occurredAt)
+                END)
+              ) = 0 THEN NULL
+              ELSE (
+                SUM(CASE WHEN ct.mealSlot = 'lunch' OR (ct.mealSlot = 'lunch_dinner' AND HOUR(ct.occurredAt) >= 10 AND HOUR(ct.occurredAt) < 15) THEN ct.amount ELSE 0 END)
+                + SUM(CASE
+                  WHEN ct.mealSlot IN ('dinner', 'night', 'night_snack', 'supper', 'late_night')
+                    OR (ct.mealSlot = 'lunch_dinner' AND NOT (HOUR(ct.occurredAt) >= 10 AND HOUR(ct.occurredAt) < 15))
+                  THEN ct.amount ELSE 0 END)
+              ) / (
+                COUNT(DISTINCT CASE
+                  WHEN ct.mealSlot = 'lunch' OR (ct.mealSlot = 'lunch_dinner' AND HOUR(ct.occurredAt) >= 10 AND HOUR(ct.occurredAt) < 15)
+                  THEN DATE(ct.occurredAt)
+                END)
+                + COUNT(DISTINCT CASE
+                  WHEN ct.mealSlot IN ('dinner', 'night', 'night_snack', 'supper', 'late_night')
+                    OR (ct.mealSlot = 'lunch_dinner' AND NOT (HOUR(ct.occurredAt) >= 10 AND HOUR(ct.occurredAt) < 15))
+                  THEN DATE(ct.occurredAt)
+                END)
+              )
+            END AS lunchDinnerAvg
+          FROM \`${latestTransactionTable}\` ct
+	          INNER JOIN \`Student\` s
+	            ON s.studentId COLLATE utf8mb4_unicode_ci = ct.studentNo COLLATE utf8mb4_unicode_ci
+          WHERE ct.amount > 0
+            AND ct.mealSlot IN ('breakfast', 'lunch', 'dinner', 'lunch_dinner', 'night', 'night_snack', 'supper', 'late_night')
+            AND s.isReadingCode IN (${activePlaceholders})
+            AND s.isRegisteredCode IN (${activePlaceholders})
+            AND s.personTypeCode NOT IN (${excludedPlaceholders})
+          GROUP BY ct.studentNo
+        )
+        `;
+
+      const sql = `
+        ${sourceSql}
+        SELECT
+          (
+            SELECT value
+            FROM (
+              SELECT
+                breakfastAvg AS value,
+                ROW_NUMBER() OVER (ORDER BY breakfastAvg) AS rn,
+                COUNT(*) OVER () AS cnt
+              FROM per_student
+              WHERE breakfastAvg IS NOT NULL
+            ) ranked
+            WHERE rn = GREATEST(1, CEIL(cnt * CAST(? AS DECIMAL(10, 6))))
+            LIMIT 1
+          ) AS breakfastStandard,
+          (
+            SELECT value
+            FROM (
+              SELECT
+                lunchDinnerAvg AS value,
+                ROW_NUMBER() OVER (ORDER BY lunchDinnerAvg) AS rn,
+                COUNT(*) OVER () AS cnt
+              FROM per_student
+              WHERE lunchDinnerAvg IS NOT NULL
+            ) ranked
+            WHERE rn = GREATEST(1, CEIL(cnt * CAST(? AS DECIMAL(10, 6))))
+            LIMIT 1
+          ) AS lunchDinnerStandard,
+          (SELECT COUNT(*) FROM per_student) AS sampleCount
+      `;
+      const params = batchId
+        ? [snapshotMonth, batchId, standardPercentile, standardPercentile]
+        : [
+            ...ACTIVE_STATUS_CODES,
+            ...ACTIVE_STATUS_CODES,
+            ...EXCLUDED_PERSON_TYPE_CODES,
+            standardPercentile,
+            standardPercentile,
+          ];
+
+      const rows = await safe(() => prisma.$queryRawUnsafe<
+        Array<{ breakfastStandard: unknown; lunchDinnerStandard: unknown; sampleCount: unknown }>
+      >(sql, ...params));
+      sampleCount = toNumber(rows[0]?.sampleCount);
+      breakfastStandard = toNumber(rows[0]?.breakfastStandard);
+      lunchDinnerStandard = toNumber(rows[0]?.lunchDinnerStandard);
+      cachedStandards = {
+        month: snapshotMonth,
+        percentile: standardPercentile,
+        sampleCount,
+        breakfastStandard,
+        lunchDinnerStandard,
+        computedAt: Date.now(),
+      };
+    }
+
+    const candidateScopeWhere = this.buildCandidateScopeWhere(context);
+    return {
+      safe,
+      specialDifficultyStudents,
+      reviewTasks,
+      batches,
+      snapshotMonth,
+      sampleCount,
+      breakfastStandard,
+      lunchDinnerStandard,
+      candidateScopeWhere,
+    };
+  }
+
+  private async buildDashboardSummaryFromBase(
+    baseData: Awaited<ReturnType<ReferenceDataRepository['getDashboardBaseData']>>,
+    context?: DashboardContext
+  ): Promise<DashboardSummaryResponse> {
+    const { safe, specialDifficultyStudents, reviewTasks, snapshotMonth, sampleCount, breakfastStandard, lunchDinnerStandard, candidateScopeWhere } = baseData;
+    let candidateStudentCount = 0;
+    if (snapshotMonth) {
+      const batch = await safe(() => prisma.subsidyBatch.findUnique({ where: { month: snapshotMonth } }));
+      if (batch) {
+        candidateStudentCount = await safe(() => prisma.candidateResult.count({
+          where: {
+            month: snapshotMonth,
+            batchId: batch.id,
+            ...candidateScopeWhere,
+          },
+        }));
+      } else {
+        candidateStudentCount = await safe(() => prisma.candidateResult.count({
+          where: {
+            month: snapshotMonth,
+            ...candidateScopeWhere,
+          },
+        }));
+      }
+    }
+
+    const dashboardBatch = snapshotMonth
+      ? await safe(() => prisma.subsidyBatch.findUnique({ where: { month: snapshotMonth } }))
+      : null;
+    const dashboardBatchId = dashboardBatch?.id ?? null;
+    const role = String(context?.role ?? '').trim();
+    const pendingStatusByRole: Record<string, string[]> = {
+      counselor: ['pending_counselor'],
+      college_admin: ['pending_college'],
+      student_affairs: ['pending_final'],
+      admin: ['pending_counselor', 'pending_college', 'pending_funding_office', 'pending_final'],
+    };
+    const overdueStatusByRole: Record<string, string[]> = {
+      counselor: ['pending_counselor', 'counselor_overdue'],
+      college_admin: ['pending_counselor', 'pending_college', 'counselor_overdue', 'college_overdue'],
+      student_affairs: [
+        'pending_counselor',
+        'pending_college',
+        'pending_funding_office',
+        'pending_final',
+        'counselor_overdue',
+        'college_overdue',
+        'funding_office_overdue',
+        'final_overdue',
+      ],
+      admin: [
+        'pending_counselor',
+        'pending_college',
+        'pending_funding_office',
+        'pending_final',
+        'counselor_overdue',
+        'college_overdue',
+        'funding_office_overdue',
+        'final_overdue',
+      ],
+    };
+    const pendingStatuses = pendingStatusByRole[role] ?? ['pending_counselor', 'pending_college', 'pending_funding_office', 'pending_final'];
+    const overdueStatuses = overdueStatusByRole[role] ?? ['counselor_overdue', 'college_overdue', 'funding_office_overdue', 'final_overdue'];
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+
+    const [subsidySum, selectedCount, pendingCount, overdueCount] = await Promise.all([
+      safe(() =>
+        prisma.finalSubsidyResult.aggregate({
+          where: dashboardBatchId
+            ? {
+                batchId: dashboardBatchId,
+                selected: true,
+                finalDecision: 'included',
+              }
+            : undefined,
+          _sum: { totalSubsidy: true },
+        })
+      ),
+      dashboardBatchId
+        ? safe(() =>
+            prisma.finalSubsidyResult.count({
+              where: {
+                batchId: dashboardBatchId,
+                selected: true,
+                finalDecision: 'included',
+              },
+            })
+          )
+        : 0,
+      dashboardBatchId && snapshotMonth
+        ? safe(() =>
+            prisma.candidateResult.count({
+              where: {
+                workflowStatus: {
+                  in: pendingStatuses,
+                },
+                ...candidateScopeWhere,
+              },
+            })
+          )
+        : 0,
+      safe(() =>
+        prisma.candidateResult.count({
+          where: {
+            ...candidateScopeWhere,
+            workflowStatus: {
+              in: overdueStatuses,
+            },
+            batch: {
+              startTime: {
+                lte: sevenDaysAgo,
+              },
+            },
+          },
+        })
+      ),
+    ]);
+
+    const totalSubsidy = toNumber(subsidySum._sum.totalSubsidy);
+    const sampleText = `${sampleCount} 人样本`;
+
+    return {
+      stats: [
+        { name: '特别困难学生人数', value: specialDifficultyStudents.toLocaleString('zh-CN'), change: '来自困难认定', icon: 'users', color: 'text-blue-600', bg: 'bg-blue-50' },
+        { name: '候选学生人数', value: candidateStudentCount.toLocaleString('zh-CN'), change: `${snapshotMonth || '-'} 消费分析`, icon: 'users', color: 'text-indigo-600', bg: 'bg-indigo-50' },
+        { name: '早餐补助标准', value: toCurrencyDisplay(breakfastStandard), change: sampleText, icon: 'trend', color: 'text-emerald-600', bg: 'bg-emerald-50' },
+        { name: '午晚餐补助标准', value: toCurrencyDisplay(lunchDinnerStandard), change: sampleText, icon: 'trend', color: 'text-emerald-600', bg: 'bg-emerald-50' },
+        { name: '本月补助总额', value: `¥${totalSubsidy.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, change: `发放 ${selectedCount} 人`, icon: 'trend', color: 'text-blue-600', bg: 'bg-blue-50' },
+        { name: '逾期 / 待处理', value: `${overdueCount} / ${pendingCount}`, change: '来自实时库统计', icon: 'alert', color: 'text-red-600', bg: 'bg-red-50' },
+      ],
+      activities: reviewTasks.map((item) => ({
+        user: normalizeMojibakeText(item.reviewerName ?? '系统'),
+        action: normalizeMojibakeText(item.comment ?? item.resultLabel),
+        time: formatDateTime(item.reviewedAt),
+        type:
+          item.stage === 'counselor'
+            ? 'confirm'
+            : item.stage === 'college'
+              ? 'audit'
+              : item.stage === 'student_affairs'
+                ? 'final'
+              : 'system',
+      })),
+    };
+  }
+
+  private async buildDashboardAnalyticsFromBase(
+    baseData: Awaited<ReturnType<ReferenceDataRepository['getDashboardBaseData']>>
+  ): Promise<DashboardAnalyticsResponse> {
+    const { batches, candidateScopeWhere } = baseData;
+    return {
+      trends: await this.buildDashboardTrends(batches, candidateScopeWhere),
+      consumptionAnalytics: await this.buildConsumptionAnalytics(batches, candidateScopeWhere),
+    };
+  }
+
   async ensureAuditReviewerAssignmentTable() {
     await prisma.$executeRawUnsafe(`
       CREATE TABLE IF NOT EXISTS audit_reviewer_assignment (
@@ -1057,306 +1428,43 @@ export class ReferenceDataRepository {
   }
 
   async getDashboardData(context?: DashboardContext): Promise<DashboardResponse> {
-    const safe = <T>(operation: () => Promise<T>) =>
-      retryOnTransientDatabaseConnectionError(operation, { maxRetries: 2, retryDelayMs: 200 });
-
-    const [specialDifficultyStudents, syncJobs, reviewTasks, batches] = await Promise.all([
-      safe(() => this.countSpecialDifficultyStudents()),
-      safe(() => prisma.syncJob.findMany({ orderBy: { lastRunAt: 'desc' }, take: 4 })),
-      safe(() => prisma.reviewRecord.findMany({ orderBy: { reviewedAt: 'desc' }, take: 200 })),
-      safe(() => prisma.subsidyBatch.findMany({ orderBy: { month: 'desc' }, take: 12 })),
+    const [summary, analytics] = await Promise.all([
+      this.getDashboardSummary(context),
+      this.getDashboardAnalytics(context),
     ]);
-    const systemConfig = await safe(() => prisma.systemConfig.findUnique({ where: { id: 1 } }));
-    const standardPercentile = Math.min(1, Math.max(0.01, systemConfig?.standardPercentile ?? 0.25));
-
-    const tableRows = await safe(() =>
-      prisma.$queryRawUnsafe<Array<Record<string, unknown>>>("SHOW TABLES LIKE 'card_transaction_%'")
-    );
-    const tableNames = tableRows
-      .map((row) => Object.values(row)[0])
-      .filter((value): value is string => typeof value === 'string')
-      .sort();
-    const latestTransactionTable = tableNames.at(-1) ?? '';
-    const snapshotMonth = latestTransactionTable ? parseMonthFromTableName(latestTransactionTable) : '';
-
-    let sampleCount = 0;
-    let breakfastStandard = 0;
-    let lunchDinnerStandard = 0;
-    if (snapshotMonth) {
-      const activePlaceholders = ACTIVE_STATUS_CODES.map(() => '?').join(', ');
-      const excludedPlaceholders = EXCLUDED_PERSON_TYPE_CODES.map(() => '?').join(', ');
-      const batch = await safe(() => prisma.subsidyBatch.findUnique({ where: { month: snapshotMonth } }));
-      const batchId = batch?.id ?? null;
-      if (batchId) {
-        await safe(() => this.ensureStudentMonthStats(batchId, snapshotMonth));
-      }
-      const sourceSql = batchId
-        ? `
-        WITH per_student AS (
-          SELECT
-            CASE WHEN sms.breakfastCount > 0 THEN sms.breakfastAvg ELSE NULL END AS breakfastAvg,
-            CASE WHEN sms.lunchDinnerCount > 0 THEN sms.lunchDinnerAvg ELSE NULL END AS lunchDinnerAvg
-          FROM \`StudentMonthStat\` sms
-          WHERE sms.month = ?
-            AND sms.batchId = ?
-        )
-        `
-        : `
-        WITH per_student AS (
-          SELECT
-            ct.studentNo,
-            CASE
-              WHEN COUNT(DISTINCT CASE WHEN ct.mealSlot = 'breakfast' THEN DATE(ct.occurredAt) END) = 0 THEN NULL
-              ELSE SUM(CASE WHEN ct.mealSlot = 'breakfast' THEN ct.amount ELSE 0 END)
-                / COUNT(DISTINCT CASE WHEN ct.mealSlot = 'breakfast' THEN DATE(ct.occurredAt) END)
-            END AS breakfastAvg,
-            CASE
-              WHEN (
-                COUNT(DISTINCT CASE
-                  WHEN ct.mealSlot = 'lunch' OR (ct.mealSlot = 'lunch_dinner' AND HOUR(ct.occurredAt) >= 10 AND HOUR(ct.occurredAt) < 15)
-                  THEN DATE(ct.occurredAt)
-                END)
-                + COUNT(DISTINCT CASE
-                  WHEN ct.mealSlot IN ('dinner', 'night', 'night_snack', 'supper', 'late_night')
-                    OR (ct.mealSlot = 'lunch_dinner' AND NOT (HOUR(ct.occurredAt) >= 10 AND HOUR(ct.occurredAt) < 15))
-                  THEN DATE(ct.occurredAt)
-                END)
-              ) = 0 THEN NULL
-              ELSE (
-                SUM(CASE WHEN ct.mealSlot = 'lunch' OR (ct.mealSlot = 'lunch_dinner' AND HOUR(ct.occurredAt) >= 10 AND HOUR(ct.occurredAt) < 15) THEN ct.amount ELSE 0 END)
-                + SUM(CASE
-                  WHEN ct.mealSlot IN ('dinner', 'night', 'night_snack', 'supper', 'late_night')
-                    OR (ct.mealSlot = 'lunch_dinner' AND NOT (HOUR(ct.occurredAt) >= 10 AND HOUR(ct.occurredAt) < 15))
-                  THEN ct.amount ELSE 0 END)
-              ) / (
-                COUNT(DISTINCT CASE
-                  WHEN ct.mealSlot = 'lunch' OR (ct.mealSlot = 'lunch_dinner' AND HOUR(ct.occurredAt) >= 10 AND HOUR(ct.occurredAt) < 15)
-                  THEN DATE(ct.occurredAt)
-                END)
-                + COUNT(DISTINCT CASE
-                  WHEN ct.mealSlot IN ('dinner', 'night', 'night_snack', 'supper', 'late_night')
-                    OR (ct.mealSlot = 'lunch_dinner' AND NOT (HOUR(ct.occurredAt) >= 10 AND HOUR(ct.occurredAt) < 15))
-                  THEN DATE(ct.occurredAt)
-                END)
-              )
-            END AS lunchDinnerAvg
-          FROM \`${latestTransactionTable}\` ct
-	          INNER JOIN \`Student\` s
-	            ON s.studentId COLLATE utf8mb4_unicode_ci = ct.studentNo COLLATE utf8mb4_unicode_ci
-          WHERE ct.amount > 0
-            AND ct.mealSlot IN ('breakfast', 'lunch', 'dinner', 'lunch_dinner', 'night', 'night_snack', 'supper', 'late_night')
-            AND s.isReadingCode IN (${activePlaceholders})
-            AND s.isRegisteredCode IN (${activePlaceholders})
-            AND s.personTypeCode NOT IN (${excludedPlaceholders})
-          GROUP BY ct.studentNo
-        )
-        `;
-
-      const sql = `
-        ${sourceSql}
-        SELECT
-          (
-            SELECT value
-            FROM (
-              SELECT
-                breakfastAvg AS value,
-                ROW_NUMBER() OVER (ORDER BY breakfastAvg) AS rn,
-                COUNT(*) OVER () AS cnt
-              FROM per_student
-              WHERE breakfastAvg IS NOT NULL
-            ) ranked
-            WHERE rn = GREATEST(1, CEIL(cnt * CAST(? AS DECIMAL(10, 6))))
-            LIMIT 1
-          ) AS breakfastStandard,
-          (
-            SELECT value
-            FROM (
-              SELECT
-                lunchDinnerAvg AS value,
-                ROW_NUMBER() OVER (ORDER BY lunchDinnerAvg) AS rn,
-                COUNT(*) OVER () AS cnt
-              FROM per_student
-              WHERE lunchDinnerAvg IS NOT NULL
-            ) ranked
-            WHERE rn = GREATEST(1, CEIL(cnt * CAST(? AS DECIMAL(10, 6))))
-            LIMIT 1
-          ) AS lunchDinnerStandard,
-          (SELECT COUNT(*) FROM per_student) AS sampleCount
-      `;
-      const params = batchId
-        ? [snapshotMonth, batchId, standardPercentile, standardPercentile]
-        : [
-            ...ACTIVE_STATUS_CODES,
-            ...ACTIVE_STATUS_CODES,
-            ...EXCLUDED_PERSON_TYPE_CODES,
-            standardPercentile,
-            standardPercentile,
-          ];
-
-      const rows = await safe(() => prisma.$queryRawUnsafe<
-        Array<{ breakfastStandard: unknown; lunchDinnerStandard: unknown; sampleCount: unknown }>
-      >(sql, ...params));
-      sampleCount = toNumber(rows[0]?.sampleCount);
-      breakfastStandard = toNumber(rows[0]?.breakfastStandard);
-      lunchDinnerStandard = toNumber(rows[0]?.lunchDinnerStandard);
-      cachedStandards = {
-        month: snapshotMonth,
-        percentile: standardPercentile,
-        sampleCount,
-        breakfastStandard,
-        lunchDinnerStandard,
-        computedAt: Date.now(),
-      };
-    }
-
-    const candidateScopeWhere = this.buildCandidateScopeWhere(context);
-    let candidateStudentCount = 0;
-    if (snapshotMonth) {
-      const batch = await safe(() => prisma.subsidyBatch.findUnique({ where: { month: snapshotMonth } }));
-      if (batch) {
-        candidateStudentCount = await safe(() => prisma.candidateResult.count({
-          where: {
-            month: snapshotMonth,
-            batchId: batch.id,
-            ...candidateScopeWhere,
-          },
-        }));
-      } else {
-        candidateStudentCount = await safe(() => prisma.candidateResult.count({
-          where: {
-            month: snapshotMonth,
-            ...candidateScopeWhere,
-          },
-        }));
-      }
-    }
-
-    const dashboardBatch = snapshotMonth
-      ? await safe(() => prisma.subsidyBatch.findUnique({ where: { month: snapshotMonth } }))
-      : null;
-    const dashboardBatchId = dashboardBatch?.id ?? null;
-
-    const role = String(context?.role ?? '').trim();
-    const pendingStatusByRole: Record<string, string[]> = {
-      counselor: ['pending_counselor'],
-      college_admin: ['pending_college'],
-      student_affairs: ['pending_final'],
-      // Admin can operate across stages; keep global pending view.
-      admin: ['pending_counselor', 'pending_college', 'pending_funding_office', 'pending_final'],
-    };
-    const overdueStatusByRole: Record<string, string[]> = {
-      // 逾期口径：批次发起超过7天，且对应审核环节仍未处理（pending）或已被标记overdue。
-      counselor: ['pending_counselor', 'counselor_overdue'],
-      college_admin: ['pending_counselor', 'pending_college', 'counselor_overdue', 'college_overdue'],
-      // 学生处首页逾期：历史累计全流程逾期，不论是否已轮到学生处终审。
-      student_affairs: [
-        'pending_counselor',
-        'pending_college',
-        'pending_funding_office',
-        'pending_final',
-        'counselor_overdue',
-        'college_overdue',
-        'funding_office_overdue',
-        'final_overdue',
-      ],
-      // Admin covers all stages.
-      admin: [
-        'pending_counselor',
-        'pending_college',
-        'pending_funding_office',
-        'pending_final',
-        'counselor_overdue',
-        'college_overdue',
-        'funding_office_overdue',
-        'final_overdue',
-      ],
-    };
-    const pendingStatuses = pendingStatusByRole[role] ?? ['pending_counselor', 'pending_college', 'pending_funding_office', 'pending_final'];
-    const overdueStatuses = overdueStatusByRole[role] ?? ['counselor_overdue', 'college_overdue', 'funding_office_overdue', 'final_overdue'];
-
-    const now = Date.now();
-    const sevenDaysAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
-
-    const [subsidySum, selectedCount, pendingCount, overdueCount] = await Promise.all([
-      safe(() =>
-        prisma.finalSubsidyResult.aggregate({
-          where: dashboardBatchId
-            ? {
-                batchId: dashboardBatchId,
-                selected: true,
-                finalDecision: 'included',
-              }
-            : undefined,
-          _sum: { totalSubsidy: true },
-        })
-      ),
-      dashboardBatchId
-        ? safe(() =>
-            prisma.finalSubsidyResult.count({
-              where: {
-                batchId: dashboardBatchId,
-                selected: true,
-                finalDecision: 'included',
-              },
-            })
-          )
-        : 0,
-      dashboardBatchId && snapshotMonth
-        ? safe(() =>
-            prisma.candidateResult.count({
-              where: {
-                workflowStatus: {
-                  in: pendingStatuses,
-                },
-                ...candidateScopeWhere,
-              },
-            })
-          )
-        : 0,
-      safe(() =>
-        prisma.candidateResult.count({
-          where: {
-            ...candidateScopeWhere,
-            workflowStatus: {
-              in: overdueStatuses,
-            },
-            batch: {
-              startTime: {
-                lte: sevenDaysAgo,
-              },
-            },
-          },
-        })
-      ),
-    ]);
-
-    const totalSubsidy = toNumber(subsidySum._sum.totalSubsidy);
-    const sampleText = `${sampleCount} 人样本`;
 
     return {
-      stats: [
-        { name: '特别困难学生人数', value: specialDifficultyStudents.toLocaleString('zh-CN'), change: '来自困难认定', icon: 'users', color: 'text-blue-600', bg: 'bg-blue-50' },
-        { name: '候选学生人数', value: candidateStudentCount.toLocaleString('zh-CN'), change: `${snapshotMonth || '-'} 消费分析`, icon: 'users', color: 'text-indigo-600', bg: 'bg-indigo-50' },
-        { name: '早餐补助标准', value: toCurrencyDisplay(breakfastStandard), change: sampleText, icon: 'trend', color: 'text-emerald-600', bg: 'bg-emerald-50' },
-        { name: '午晚餐补助标准', value: toCurrencyDisplay(lunchDinnerStandard), change: sampleText, icon: 'trend', color: 'text-emerald-600', bg: 'bg-emerald-50' },
-        { name: '本月补助总额', value: `¥${totalSubsidy.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, change: `发放 ${selectedCount} 人`, icon: 'trend', color: 'text-blue-600', bg: 'bg-blue-50' },
-        { name: '逾期 / 待处理', value: `${overdueCount} / ${pendingCount}`, change: '来自实时库统计', icon: 'alert', color: 'text-red-600', bg: 'bg-red-50' },
-      ],
-      trends: await this.buildDashboardTrends(batches, candidateScopeWhere),
-      activities: reviewTasks.map((item) => ({
-        user: normalizeMojibakeText(item.reviewerName ?? '系统'),
-        action: normalizeMojibakeText(item.comment ?? item.resultLabel),
-        time: formatDateTime(item.reviewedAt),
-        type:
-          item.stage === 'counselor'
-            ? 'confirm'
-            : item.stage === 'college'
-              ? 'audit'
-              : item.stage === 'student_affairs'
-                ? 'final'
-                : 'system',
-      })),
+      stats: summary.stats,
+      activities: summary.activities,
+      trends: analytics.trends,
+      consumptionAnalytics: analytics.consumptionAnalytics,
     };
+  }
+
+  async getDashboardSummary(context?: DashboardContext): Promise<DashboardSummaryResponse> {
+    const cacheKey = dashboardContextCacheKey(context);
+    const cached = getCachedValue(dashboardSummaryCache, cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const baseData = await this.getDashboardBaseData(context);
+    const summary = await this.buildDashboardSummaryFromBase(baseData, context);
+    setCachedValue(dashboardSummaryCache, cacheKey, summary, DASHBOARD_SUMMARY_CACHE_TTL_MS);
+    return summary;
+  }
+
+  async getDashboardAnalytics(context?: DashboardContext): Promise<DashboardAnalyticsResponse> {
+    const cacheKey = dashboardContextCacheKey(context);
+    const cached = getCachedValue(dashboardAnalyticsCache, cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const baseData = await this.getDashboardBaseData(context);
+    const analytics = await this.buildDashboardAnalyticsFromBase(baseData);
+    setCachedValue(dashboardAnalyticsCache, cacheKey, analytics, DASHBOARD_ANALYTICS_CACHE_TTL_MS);
+    return analytics;
   }
 
   private async buildDashboardTrends(
@@ -1410,6 +1518,122 @@ export class ReferenceDataRepository {
       students: candidateCountByMonth.get(batch.month) ?? 0,
       amount: roundAmount(subsidySumByBatchId.get(batch.id) ?? 0),
     }));
+  }
+
+  private async buildConsumptionAnalytics(
+    batches: Array<{ id: string; month: string }>,
+    candidateScopeWhere: ReturnType<ReferenceDataRepository['buildCandidateScopeWhere']>
+  ) {
+    if (!Array.isArray(batches) || batches.length === 0) {
+      return { series: [], latest: null };
+    }
+
+    const ordered = [...batches].sort((a, b) => a.month.localeCompare(b.month));
+    for (const batch of ordered) {
+      await this.ensureStudentMonthStats(batch.id, batch.month);
+    }
+
+    const stats = await prisma.studentMonthStat.findMany({
+      where: {
+        batchId: { in: ordered.map((item) => item.id) },
+        student: (candidateScopeWhere as { student?: object }).student as object | undefined,
+      },
+      select: {
+        month: true,
+        breakfastCount: true,
+        breakfastAvg: true,
+        lunchDinnerCount: true,
+        lunchDinnerAvg: true,
+        totalAmount: true,
+        daysCount: true,
+        attendanceDays: true,
+      },
+      orderBy: [{ month: 'asc' }],
+    });
+
+    const statsByMonth = new Map<
+      string,
+      Array<{
+        breakfastCount: number;
+        breakfastAvg: number;
+        lunchDinnerCount: number;
+        lunchDinnerAvg: number;
+        totalAmount: number;
+        daysCount: number;
+        attendanceDays: number;
+      }>
+    >();
+
+    for (const row of stats) {
+      const month = row.month;
+      const bucket = statsByMonth.get(month) ?? [];
+      bucket.push({
+        breakfastCount: Math.max(0, Number(row.breakfastCount ?? 0)),
+        breakfastAvg: toAmount(row.breakfastAvg),
+        lunchDinnerCount: Math.max(0, Number(row.lunchDinnerCount ?? 0)),
+        lunchDinnerAvg: toAmount(row.lunchDinnerAvg),
+        totalAmount: toAmount(row.totalAmount),
+        daysCount: Math.max(0, Number(row.daysCount ?? 0)),
+        attendanceDays: Math.max(0, Number(row.attendanceDays ?? 0)),
+      });
+      statsByMonth.set(month, bucket);
+    }
+
+    const series = ordered.map((batch) => {
+      const rows = statsByMonth.get(batch.month) ?? [];
+      const activeStudents = rows.length;
+      const breakfastRows = rows.filter((item) => item.breakfastCount > 0);
+      const lunchDinnerRows = rows.filter((item) => item.lunchDinnerCount > 0);
+      const breakfastValues = breakfastRows.map((item) => item.breakfastAvg).filter((item) => item > 0);
+      const lunchDinnerValues = lunchDinnerRows.map((item) => item.lunchDinnerAvg).filter((item) => item > 0);
+      const totalAvg =
+        activeStudents > 0 ? roundAmount(rows.reduce((sum, item) => sum + item.totalAmount, 0) / activeStudents) : 0;
+      const daysAvg =
+        activeStudents > 0 ? roundAmount(rows.reduce((sum, item) => sum + item.daysCount, 0) / activeStudents) : 0;
+      const attendanceDaysAvg =
+        activeStudents > 0 ? roundAmount(rows.reduce((sum, item) => sum + item.attendanceDays, 0) / activeStudents) : 0;
+
+      return {
+        month: batch.month,
+        name: `${Number(batch.month.slice(5))}月`,
+        activeStudents,
+        breakfastStudents: breakfastRows.length,
+        lunchDinnerStudents: lunchDinnerRows.length,
+        breakfastParticipationRate: activeStudents > 0 ? roundAmount(breakfastRows.length / activeStudents) : 0,
+        lunchDinnerParticipationRate: activeStudents > 0 ? roundAmount(lunchDinnerRows.length / activeStudents) : 0,
+        breakfastP25: percentileValue(breakfastValues, 0.25),
+        breakfastP50: percentileValue(breakfastValues, 0.5),
+        breakfastAvg:
+          breakfastValues.length > 0 ? roundAmount(breakfastValues.reduce((sum, item) => sum + item, 0) / breakfastValues.length) : 0,
+        lunchDinnerP25: percentileValue(lunchDinnerValues, 0.25),
+        lunchDinnerP50: percentileValue(lunchDinnerValues, 0.5),
+        lunchDinnerAvg:
+          lunchDinnerValues.length > 0 ? roundAmount(lunchDinnerValues.reduce((sum, item) => sum + item, 0) / lunchDinnerValues.length) : 0,
+        totalAvg,
+        daysAvg,
+        attendanceDaysAvg,
+      };
+    });
+
+    const latest = series.at(-1)
+      ? {
+          latestMonth: series[series.length - 1].month,
+          sampleStudents: series[series.length - 1].activeStudents,
+          breakfastParticipationRate: series[series.length - 1].breakfastParticipationRate,
+          lunchDinnerParticipationRate: series[series.length - 1].lunchDinnerParticipationRate,
+          breakfastP25: series[series.length - 1].breakfastP25,
+          breakfastP50: series[series.length - 1].breakfastP50,
+          breakfastAvg: series[series.length - 1].breakfastAvg,
+          lunchDinnerP25: series[series.length - 1].lunchDinnerP25,
+          lunchDinnerP50: series[series.length - 1].lunchDinnerP50,
+          lunchDinnerAvg: series[series.length - 1].lunchDinnerAvg,
+          totalAvg: series[series.length - 1].totalAvg,
+          daysAvg: series[series.length - 1].daysAvg,
+          attendanceDaysAvg: series[series.length - 1].attendanceDaysAvg,
+        }
+      : null;
+
+    return { series, latest };
   }
 
   async listBatches(): Promise<BatchSummary[]> {
@@ -1468,7 +1692,15 @@ export class ReferenceDataRepository {
   }
 
   async listSyncJobs(): Promise<SyncJobRecord[]> {
-    const jobs = await prisma.syncJob.findMany();
+    const jobs = await prisma.syncJob.findMany({
+      where: {
+        NOT: {
+          source: {
+            startsWith: 'system_',
+          },
+        },
+      },
+    });
 
     // Keep only the latest row for each logical sync task to avoid duplicate cards in UI.
     // Use source (not name) as the stable key so renaming won't create a new card.

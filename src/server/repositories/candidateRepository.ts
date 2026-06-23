@@ -22,6 +22,9 @@ type CandidateSnapshotFilters = {
   college?: string;
   counselorEmployeeNo?: string;
   counselorName?: string;
+  candidateType?: 'special_difficulty';
+  sortBy?: 'college';
+  sortDirection?: 'asc' | 'desc';
 };
 
 function formatDate(value: Date) {
@@ -41,9 +44,13 @@ function toNumber(value: { toString(): string } | number | null | undefined) {
   return typeof value === 'number' ? value : Number(value.toString());
 }
 
+function roundAmount(value: number) {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
 function toAmount(value: { toString(): string } | number | null | undefined) {
   const amount = toNumber(value);
-  return Math.round((amount + Number.EPSILON) * 100) / 100;
+  return roundAmount(amount);
 }
 
 function getStageLabel(stage: string) {
@@ -197,6 +204,30 @@ function safeNullableNumber(value: unknown) {
   if (value == null) return null;
   const n = Number(value);
   return Number.isNaN(n) ? null : n;
+}
+
+function safeRate(numerator: number, denominator: number) {
+  if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator <= 0) return 0;
+  return Math.round(((numerator / denominator) + Number.EPSILON) * 10000) / 10000;
+}
+
+function buildMetricComparison(current: number, previous: number | null) {
+  if (previous == null || !Number.isFinite(previous)) {
+    return {
+      current: roundAmount(current),
+      previous: null,
+      delta: null,
+      deltaRate: null,
+    };
+  }
+  const delta = roundAmount(current - previous);
+  const deltaRate = previous === 0 ? null : roundAmount(delta / previous);
+  return {
+    current: roundAmount(current),
+    previous: roundAmount(previous),
+    delta,
+    deltaRate,
+  };
 }
 
 function formatAverageSpendLabel(breakfastAvg: number | null, lunchDinnerAvg: number | null) {
@@ -586,12 +617,22 @@ export class CandidateRepository {
     const normalizedCollege = String(filters?.college ?? '').trim();
     const normalizedCounselorEmployeeNo = String(filters?.counselorEmployeeNo ?? '').trim();
     const normalizedCounselorName = String(filters?.counselorName ?? '').trim();
+    const candidateType =
+      filters?.candidateType === 'special_difficulty' ? filters.candidateType : '';
+    const sortBy = filters?.sortBy === 'college' ? 'college' : '';
+    const sortDirection = filters?.sortDirection === 'desc' ? 'desc' : 'asc';
 
     const filterSqlParts: string[] = [];
     const filterParams: string[] = [];
     if (normalizedCollege) {
-      filterSqlParts.push(`AND cls.college LIKE ?`);
-      filterParams.push(`%${normalizedCollege}%`);
+      filterSqlParts.push(`
+        AND TRIM(cls.college) COLLATE utf8mb4_unicode_ci = CAST(? AS CHAR) COLLATE utf8mb4_unicode_ci
+      `);
+      filterParams.push(normalizedCollege);
+    }
+    if (candidateType) {
+      filterSqlParts.push(`AND cls.type = ?`);
+      filterParams.push(candidateType);
     }
     const counselorEmployeeNoSql = `
       EXISTS (
@@ -616,6 +657,21 @@ export class CandidateRepository {
       filterParams.push(`%${normalizedCounselorEmployeeNo}%`);
     }
     const filterSql = filterSqlParts.join('\n');
+    const orderBySql =
+      sortBy === 'college'
+        ? `
+          ORDER BY
+            TRIM(cls.college) COLLATE utf8mb4_unicode_ci ${sortDirection.toUpperCase()},
+            CAST(COALESCE(fsr.totalSubsidy, cls.subsidyEstimate, 0) AS DECIMAL(12,2)) DESC,
+            cls.rank ASC,
+            cls.studentId ASC
+        `
+        : `
+          ORDER BY
+            CAST(COALESCE(fsr.totalSubsidy, cls.subsidyEstimate, 0) AS DECIMAL(12,2)) DESC,
+            cls.rank ASC,
+            cls.studentId ASC
+        `;
 
     const [total, rows] = await Promise.all([
       prisma.$queryRawUnsafe<Array<{ total: unknown }>>(
@@ -700,10 +756,7 @@ export class CandidateRepository {
           WHERE cls.month = ?
           ${scopeSql}
           ${filterSql}
-          ORDER BY
-            CAST(COALESCE(fsr.totalSubsidy, cls.subsidyEstimate, 0) AS DECIMAL(12,2)) DESC,
-            cls.rank ASC,
-            cls.studentId ASC
+          ${orderBySql}
           LIMIT ?
           OFFSET ?
         `,
@@ -1287,6 +1340,193 @@ export class CandidateRepository {
     });
   }
 
+  private async resolveMonthlyP50(month: string) {
+    const now = Date.now();
+    if (monthlyP50Cache && monthlyP50Cache.month === month && now - monthlyP50Cache.computedAt < 5 * 60 * 1000) {
+      return {
+        breakfastP50: monthlyP50Cache.breakfastP50,
+        lunchDinnerP50: monthlyP50Cache.lunchDinnerP50,
+      };
+    }
+
+    let breakfastP50 = 0;
+    let lunchDinnerP50 = 0;
+    const rows = await prisma.$queryRawUnsafe<Array<{ breakfastP50: unknown; lunchDinnerP50: unknown }>>(
+      `
+        SELECT
+          (
+            SELECT t.breakfastAvg
+            FROM (
+              SELECT
+                sms.breakfastAvg,
+                ROW_NUMBER() OVER (ORDER BY sms.breakfastAvg) AS rn,
+                COUNT(*) OVER () AS cnt
+              FROM \`StudentMonthStat\` sms
+              WHERE sms.month = ?
+                AND sms.breakfastCount > 0
+            ) t
+            WHERE t.rn = GREATEST(1, CEIL(t.cnt * 0.5))
+            LIMIT 1
+          ) AS breakfastP50,
+          (
+            SELECT t.lunchDinnerAvg
+            FROM (
+              SELECT
+                sms.lunchDinnerAvg,
+                ROW_NUMBER() OVER (ORDER BY sms.lunchDinnerAvg) AS rn,
+                COUNT(*) OVER () AS cnt
+              FROM \`StudentMonthStat\` sms
+              WHERE sms.month = ?
+                AND sms.lunchDinnerCount > 0
+            ) t
+            WHERE t.rn = GREATEST(1, CEIL(t.cnt * 0.5))
+            LIMIT 1
+          ) AS lunchDinnerP50
+      `,
+      month,
+      month
+    );
+    breakfastP50 = toAmount(rows[0]?.breakfastP50);
+    lunchDinnerP50 = toAmount(rows[0]?.lunchDinnerP50);
+
+    if (breakfastP50 <= 0 && lunchDinnerP50 <= 0) {
+      const tableName = monthToTableName(month);
+      if (tableName) {
+        const tableRows = await prisma.$queryRawUnsafe<Array<{ TABLE_NAME: string }>>(
+          `
+            SELECT TABLE_NAME
+            FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND LOWER(TABLE_NAME) = LOWER(?)
+            LIMIT 1
+          `,
+          tableName
+        );
+        const actualTableName = tableRows[0]?.TABLE_NAME;
+        if (actualTableName) {
+          const fallbackRows = await prisma.$queryRawUnsafe<Array<{ breakfastP50: unknown; lunchDinnerP50: unknown }>>(
+            `
+              WITH per_student AS (
+                SELECT
+                  studentNo,
+                  CASE
+                    WHEN COUNT(DISTINCT CASE WHEN mealSlot = 'breakfast' THEN DATE(occurredAt) END) = 0 THEN NULL
+                    ELSE SUM(CASE WHEN mealSlot = 'breakfast' THEN amount ELSE 0 END)
+                      / COUNT(DISTINCT CASE WHEN mealSlot = 'breakfast' THEN DATE(occurredAt) END)
+                  END AS breakfastAvg,
+                  CASE
+                    WHEN (
+                      COUNT(DISTINCT CASE
+                        WHEN mealSlot = 'lunch' OR (mealSlot = 'lunch_dinner' AND HOUR(occurredAt) >= 10 AND HOUR(occurredAt) < 15)
+                        THEN DATE(occurredAt)
+                      END)
+                      + COUNT(DISTINCT CASE
+                        WHEN mealSlot IN ('dinner', 'night', 'night_snack', 'supper', 'late_night')
+                          OR (mealSlot = 'lunch_dinner' AND NOT (HOUR(occurredAt) >= 10 AND HOUR(occurredAt) < 15))
+                        THEN DATE(occurredAt)
+                      END)
+                    ) = 0 THEN NULL
+                    ELSE (
+                      SUM(CASE WHEN mealSlot = 'lunch' OR (mealSlot = 'lunch_dinner' AND HOUR(occurredAt) >= 10 AND HOUR(occurredAt) < 15) THEN amount ELSE 0 END)
+                      + SUM(CASE
+                        WHEN mealSlot IN ('dinner', 'night', 'night_snack', 'supper', 'late_night')
+                          OR (mealSlot = 'lunch_dinner' AND NOT (HOUR(occurredAt) >= 10 AND HOUR(occurredAt) < 15))
+                        THEN amount ELSE 0 END)
+                    ) / (
+                      COUNT(DISTINCT CASE
+                        WHEN mealSlot = 'lunch' OR (mealSlot = 'lunch_dinner' AND HOUR(occurredAt) >= 10 AND HOUR(occurredAt) < 15)
+                        THEN DATE(occurredAt)
+                      END)
+                      + COUNT(DISTINCT CASE
+                        WHEN mealSlot IN ('dinner', 'night', 'night_snack', 'supper', 'late_night')
+                          OR (mealSlot = 'lunch_dinner' AND NOT (HOUR(occurredAt) >= 10 AND HOUR(occurredAt) < 15))
+                        THEN DATE(occurredAt)
+                      END)
+                    )
+                  END AS lunchDinnerAvg
+                FROM \`${actualTableName}\`
+                WHERE amount > 0
+                  AND mealSlot IN ('breakfast', 'lunch', 'dinner', 'lunch_dinner', 'night', 'night_snack', 'supper', 'late_night')
+                GROUP BY studentNo
+              )
+              SELECT
+                (
+                  SELECT x.breakfastAvg
+                  FROM (
+                    SELECT breakfastAvg, ROW_NUMBER() OVER (ORDER BY breakfastAvg) AS rn, COUNT(*) OVER () AS cnt
+                    FROM per_student
+                    WHERE breakfastAvg IS NOT NULL
+                  ) x
+                  WHERE x.rn = GREATEST(1, CEIL(x.cnt * 0.5))
+                  LIMIT 1
+                ) AS breakfastP50,
+                (
+                  SELECT x.lunchDinnerAvg
+                  FROM (
+                    SELECT lunchDinnerAvg, ROW_NUMBER() OVER (ORDER BY lunchDinnerAvg) AS rn, COUNT(*) OVER () AS cnt
+                    FROM per_student
+                    WHERE lunchDinnerAvg IS NOT NULL
+                  ) x
+                  WHERE x.rn = GREATEST(1, CEIL(x.cnt * 0.5))
+                  LIMIT 1
+                ) AS lunchDinnerP50
+            `
+          );
+          breakfastP50 = toAmount(fallbackRows[0]?.breakfastP50);
+          lunchDinnerP50 = toAmount(fallbackRows[0]?.lunchDinnerP50);
+        }
+      }
+    }
+
+    monthlyP50Cache = {
+      month,
+      breakfastP50,
+      lunchDinnerP50,
+      computedAt: now,
+    };
+
+    return { breakfastP50, lunchDinnerP50 };
+  }
+
+  private async loadStudentMonthlySnapshot(studentRowId: string, studentNo: string, month: string) {
+    const batch = await prisma.subsidyBatch.findUnique({
+      where: { month },
+      select: { id: true },
+    });
+    const monthStat = batch
+      ? await prisma.studentMonthStat.findUnique({
+          where: {
+            batchId_studentId: {
+              batchId: batch.id,
+              studentId: studentRowId,
+            },
+          },
+        })
+      : null;
+    const fallbackStat = await this.loadStudentMonthStatFromTransactions(studentNo, month);
+    const resolved = monthStat ?? fallbackStat;
+    if (!resolved) return null;
+    const p50 = await this.resolveMonthlyP50(month);
+    const breakfastDaysCount = fallbackStat?.breakfastDaysCount ?? (resolved.breakfastCount ?? 0);
+    const lunchDinnerDaysCount = fallbackStat?.lunchDinnerDaysCount ?? (resolved.lunchDinnerCount ?? 0);
+    return {
+      month,
+      label: `${month.slice(5)}月`,
+      breakfastCount: resolved.breakfastCount ?? 0,
+      breakfastTotal: toAmount(resolved.breakfastTotal),
+      breakfastAvg: toAmount(resolved.breakfastAvg),
+      breakfastDaysCount,
+      lunchDinnerCount: resolved.lunchDinnerCount ?? 0,
+      lunchDinnerTotal: toAmount(resolved.lunchDinnerTotal),
+      lunchDinnerAvg: toAmount(resolved.lunchDinnerAvg),
+      lunchDinnerDaysCount,
+      breakfastP50: p50.breakfastP50,
+      lunchDinnerP50: p50.lunchDinnerP50,
+      daysCount: resolved.daysCount ?? 0,
+      totalAmount: toAmount(resolved.totalAmount),
+    };
+  }
+
   async listStudents() {
     const students = await prisma.student.findMany({
       where: activeStudentWhere(),
@@ -1506,19 +1746,7 @@ export class CandidateRepository {
     const activeStudentNoSet = new Set(activeStudents.map((item) => item.studentId));
     const studentRowIdByStudentNo = new Map(activeStudents.map((item) => [item.studentId, item.id]));
     const standardPercentile = Math.min(1, Math.max(0.01, batch.standardPercentile || 0.25));
-    const rollingMonths = [shiftMonth(month, -2), shiftMonth(month, -1), month].filter(Boolean);
-    if (rollingMonths.length !== 3) {
-      return 0;
-    }
-
-    const monthContexts = new Map<string, MonthlyMetricContext>();
-    for (const targetMonth of rollingMonths) {
-      const context = await this.loadMonthlyMetricContext(targetMonth, activeStudentNoSet, standardPercentile);
-      if (context) {
-        monthContexts.set(targetMonth, context);
-      }
-    }
-    const currentContext = monthContexts.get(month);
+    const currentContext = await this.loadMonthlyMetricContext(month, activeStudentNoSet, standardPercentile);
     if (!currentContext || currentContext.metricsByStudentNo.size === 0) {
       return 0;
     }
@@ -1655,7 +1883,7 @@ export class CandidateRepository {
     const candidates: Array<{
       studentNo: string;
       studentRowId: string;
-      candidateType: 'special_difficulty' | 'potential_difficulty';
+      candidateType: 'special_difficulty';
       typeLabel: string;
       averageSpendLabel: string;
       daysCount: number;
@@ -1708,62 +1936,6 @@ export class CandidateRepository {
         continue;
       }
 
-      if (isSpecial) {
-        continue;
-      }
-
-      // Potential difficulty must satisfy a consistent lane for 3 rolling months:
-      // breakfast lane: breakfast avg <= breakfast bottom10 AND breakfast days >= half month
-      // or lunch/dinner lane: lunch/dinner avg <= lunch/dinner bottom10 AND lunch/dinner days >= half month.
-      let matchedBreakfastLane3Months = true;
-      let matchedLunchDinnerLane3Months = true;
-      for (const targetMonth of rollingMonths) {
-        const context = monthContexts.get(targetMonth);
-        const metric = context?.metricsByStudentNo.get(studentNo);
-        if (!context || !metric) {
-          matchedBreakfastLane3Months = false;
-          matchedLunchDinnerLane3Months = false;
-          break;
-        }
-
-        const monthHalfDays = Math.ceil(context.monthDays / 2);
-        const breakfastLaneMatched =
-          metric.breakfastAvg != null &&
-          context.breakfastBottom10 != null &&
-          metric.breakfastAvg <= context.breakfastBottom10 &&
-          metric.breakfastDaysCount >= monthHalfDays;
-        const lunchDinnerLaneMatched =
-          metric.lunchDinnerAvg != null &&
-          context.lunchDinnerBottom10 != null &&
-          metric.lunchDinnerAvg <= context.lunchDinnerBottom10 &&
-          metric.lunchDinnerDaysCount >= monthHalfDays;
-
-        if (!breakfastLaneMatched) {
-          matchedBreakfastLane3Months = false;
-        }
-        if (!lunchDinnerLaneMatched) {
-          matchedLunchDinnerLane3Months = false;
-        }
-      }
-
-      const matchedRolling3Months = matchedBreakfastLane3Months || matchedLunchDinnerLane3Months;
-
-      if (matchedRolling3Months) {
-        candidates.push({
-          studentNo,
-          studentRowId,
-          candidateType: 'potential_difficulty',
-          typeLabel: '潜在困难',
-          averageSpendLabel: formatAverageSpendLabel(currentMetric.breakfastAvg, currentMetric.lunchDinnerAvg),
-          daysCount: currentMetric.daysCount,
-          totalAvg: currentMetric.totalAvg,
-          hitRules: [
-            '非特别困难学生',
-            '连续3个月当月早餐或午晚餐单次平均消费位于全校10%以下',
-            '连续3个月当月食堂消费天数达到在校天数的50%及以上',
-          ],
-        });
-      }
     }
 
     if (candidates.length === 0) {
@@ -1925,155 +2097,7 @@ export class CandidateRepository {
       transactionMonthStat?.breakfastDaysCount ?? (monthStatResolved?.breakfastCount ?? 0);
     const lunchDinnerDaysCountResolved =
       transactionMonthStat?.lunchDinnerDaysCount ?? (monthStatResolved?.lunchDinnerCount ?? 0);
-    let breakfastP50 = 0;
-    let lunchDinnerP50 = 0;
-    const now = Date.now();
-    if (
-      monthlyP50Cache &&
-      monthlyP50Cache.month === candidate.month &&
-      now - monthlyP50Cache.computedAt < 5 * 60 * 1000
-    ) {
-      breakfastP50 = monthlyP50Cache.breakfastP50;
-      lunchDinnerP50 = monthlyP50Cache.lunchDinnerP50;
-    } else {
-      const rows = await prisma.$queryRawUnsafe<
-        Array<{ breakfastP50: unknown; lunchDinnerP50: unknown }>
-      >(
-        `
-          SELECT
-            (
-              SELECT t.breakfastAvg
-              FROM (
-                SELECT
-                  sms.breakfastAvg,
-                  ROW_NUMBER() OVER (ORDER BY sms.breakfastAvg) AS rn,
-                  COUNT(*) OVER () AS cnt
-                FROM \`StudentMonthStat\` sms
-                WHERE sms.month = ?
-                  AND sms.breakfastCount > 0
-              ) t
-              WHERE t.rn = GREATEST(1, CEIL(t.cnt * 0.5))
-              LIMIT 1
-            ) AS breakfastP50,
-            (
-              SELECT t.lunchDinnerAvg
-              FROM (
-                SELECT
-                  sms.lunchDinnerAvg,
-                  ROW_NUMBER() OVER (ORDER BY sms.lunchDinnerAvg) AS rn,
-                  COUNT(*) OVER () AS cnt
-                FROM \`StudentMonthStat\` sms
-                WHERE sms.month = ?
-                  AND sms.lunchDinnerCount > 0
-              ) t
-              WHERE t.rn = GREATEST(1, CEIL(t.cnt * 0.5))
-              LIMIT 1
-            ) AS lunchDinnerP50
-        `,
-        candidate.month,
-        candidate.month
-      );
-      breakfastP50 = toAmount(rows[0]?.breakfastP50);
-      lunchDinnerP50 = toAmount(rows[0]?.lunchDinnerP50);
-
-      // Fallback: historical months may not have StudentMonthStat rows.
-      if (breakfastP50 <= 0 && lunchDinnerP50 <= 0) {
-        const tableName = monthToTableName(candidate.month);
-        if (tableName) {
-          const tableRows = await prisma.$queryRawUnsafe<Array<{ TABLE_NAME: string }>>(
-            `
-              SELECT TABLE_NAME
-              FROM information_schema.TABLES
-              WHERE TABLE_SCHEMA = DATABASE()
-                AND LOWER(TABLE_NAME) = LOWER(?)
-              LIMIT 1
-            `,
-            tableName
-          );
-          const actualTableName = tableRows[0]?.TABLE_NAME;
-          if (actualTableName) {
-            const fallbackRows = await prisma.$queryRawUnsafe<
-              Array<{ breakfastP50: unknown; lunchDinnerP50: unknown }>
-            >(
-              `
-                WITH per_student AS (
-                  SELECT
-                    studentNo,
-                    CASE
-                      WHEN COUNT(DISTINCT CASE WHEN mealSlot = 'breakfast' THEN DATE(occurredAt) END) = 0 THEN NULL
-                      ELSE SUM(CASE WHEN mealSlot = 'breakfast' THEN amount ELSE 0 END)
-                        / COUNT(DISTINCT CASE WHEN mealSlot = 'breakfast' THEN DATE(occurredAt) END)
-                    END AS breakfastAvg,
-                    CASE
-                      WHEN (
-                        COUNT(DISTINCT CASE
-                          WHEN mealSlot = 'lunch' OR (mealSlot = 'lunch_dinner' AND HOUR(occurredAt) >= 10 AND HOUR(occurredAt) < 15)
-                          THEN DATE(occurredAt)
-                        END)
-                        + COUNT(DISTINCT CASE
-                          WHEN mealSlot IN ('dinner', 'night', 'night_snack', 'supper', 'late_night')
-                            OR (mealSlot = 'lunch_dinner' AND NOT (HOUR(occurredAt) >= 10 AND HOUR(occurredAt) < 15))
-                          THEN DATE(occurredAt)
-                        END)
-                      ) = 0 THEN NULL
-                      ELSE (
-                        SUM(CASE WHEN mealSlot = 'lunch' OR (mealSlot = 'lunch_dinner' AND HOUR(occurredAt) >= 10 AND HOUR(occurredAt) < 15) THEN amount ELSE 0 END)
-                        + SUM(CASE
-                          WHEN mealSlot IN ('dinner', 'night', 'night_snack', 'supper', 'late_night')
-                            OR (mealSlot = 'lunch_dinner' AND NOT (HOUR(occurredAt) >= 10 AND HOUR(occurredAt) < 15))
-                          THEN amount ELSE 0 END)
-                      ) / (
-                        COUNT(DISTINCT CASE
-                          WHEN mealSlot = 'lunch' OR (mealSlot = 'lunch_dinner' AND HOUR(occurredAt) >= 10 AND HOUR(occurredAt) < 15)
-                          THEN DATE(occurredAt)
-                        END)
-                        + COUNT(DISTINCT CASE
-                          WHEN mealSlot IN ('dinner', 'night', 'night_snack', 'supper', 'late_night')
-                            OR (mealSlot = 'lunch_dinner' AND NOT (HOUR(occurredAt) >= 10 AND HOUR(occurredAt) < 15))
-                          THEN DATE(occurredAt)
-                        END)
-                      )
-                    END AS lunchDinnerAvg
-                  FROM \`${actualTableName}\`
-                  WHERE amount > 0
-                    AND mealSlot IN ('breakfast', 'lunch', 'dinner', 'lunch_dinner', 'night', 'night_snack', 'supper', 'late_night')
-                  GROUP BY studentNo
-                )
-                SELECT
-                  (
-                    SELECT x.breakfastAvg
-                    FROM (
-                      SELECT breakfastAvg, ROW_NUMBER() OVER (ORDER BY breakfastAvg) AS rn, COUNT(*) OVER () AS cnt
-                      FROM per_student
-                      WHERE breakfastAvg IS NOT NULL
-                    ) x
-                    WHERE x.rn = GREATEST(1, CEIL(x.cnt * 0.5))
-                    LIMIT 1
-                  ) AS breakfastP50,
-                  (
-                    SELECT x.lunchDinnerAvg
-                    FROM (
-                      SELECT lunchDinnerAvg, ROW_NUMBER() OVER (ORDER BY lunchDinnerAvg) AS rn, COUNT(*) OVER () AS cnt
-                      FROM per_student
-                      WHERE lunchDinnerAvg IS NOT NULL
-                    ) x
-                    WHERE x.rn = GREATEST(1, CEIL(x.cnt * 0.5))
-                    LIMIT 1
-                  ) AS lunchDinnerP50
-              `
-            );
-            breakfastP50 = toAmount(fallbackRows[0]?.breakfastP50);
-            lunchDinnerP50 = toAmount(fallbackRows[0]?.lunchDinnerP50);
-          }
-        }
-      }
-      monthlyP50Cache = {
-        month: candidate.month,
-        breakfastP50,
-        lunchDinnerP50,
-        computedAt: now,
-      };
-    }
+    const { breakfastP50, lunchDinnerP50 } = await this.resolveMonthlyP50(candidate.month);
     const finalResult = await prisma.finalSubsidyResult.findUnique({
       where: {
         batchId_studentId: {
@@ -2109,6 +2133,52 @@ export class CandidateRepository {
       relationCounselorEmployeeNo && relationCounselorNameMap.has(relationCounselorEmployeeNo)
         ? (relationCounselorNameMap.get(relationCounselorEmployeeNo) as string)
         : (String(relationCounselor?.name ?? '').trim() || relationCounselorEmployeeNo || '-');
+    const trendMonths = Array.from(new Set([
+      shiftMonth(candidate.month, -5),
+      shiftMonth(candidate.month, -4),
+      shiftMonth(candidate.month, -3),
+      shiftMonth(candidate.month, -2),
+      shiftMonth(candidate.month, -1),
+      candidate.month,
+      shiftMonth(candidate.month, -12),
+    ].filter(Boolean)));
+    const trendSnapshots = (
+      await Promise.all(
+        trendMonths.map((itemMonth) =>
+          this.loadStudentMonthlySnapshot(candidate.studentId, candidate.student.studentId, itemMonth)
+        )
+      )
+    ).filter((item): item is NonNullable<typeof item> => Boolean(item)).sort((a, b) => a.month.localeCompare(b.month));
+    const currentTrend = trendSnapshots.find((item) => item.month === candidate.month) ?? {
+      month: candidate.month,
+      label: `${candidate.month.slice(5)}月`,
+      breakfastCount: monthStatResolved?.breakfastCount ?? 0,
+      breakfastTotal: toAmount(monthStatResolved?.breakfastTotal),
+      breakfastAvg: toAmount(monthStatResolved?.breakfastAvg),
+      breakfastDaysCount: breakfastDaysCountResolved,
+      lunchDinnerCount: monthStatResolved?.lunchDinnerCount ?? 0,
+      lunchDinnerTotal: toAmount(monthStatResolved?.lunchDinnerTotal),
+      lunchDinnerAvg: toAmount(monthStatResolved?.lunchDinnerAvg),
+      lunchDinnerDaysCount: lunchDinnerDaysCountResolved,
+      breakfastP50,
+      lunchDinnerP50,
+      daysCount: monthStatResolved?.daysCount ?? 0,
+      totalAmount: toAmount(monthStatResolved?.totalAmount),
+    };
+    const previousMonth = shiftMonth(candidate.month, -1);
+    const yearAgoMonth = shiftMonth(candidate.month, -12);
+    const previousTrend = trendSnapshots.find((item) => item.month === previousMonth) ?? null;
+    const yearAgoTrend = trendSnapshots.find((item) => item.month === yearAgoMonth) ?? null;
+    const recentMonths = trendSnapshots
+      .filter((item) => item.month >= shiftMonth(candidate.month, -5))
+      .sort((a, b) => a.month.localeCompare(b.month))
+      .map((item) => ({
+        ...item,
+        breakfastGapToP50: roundAmount(item.breakfastAvg - item.breakfastP50),
+        lunchDinnerGapToP50: roundAmount(item.lunchDinnerAvg - item.lunchDinnerP50),
+        breakfastActiveRate: safeRate(item.breakfastDaysCount, daysInMonth(item.month)),
+        lunchDinnerActiveRate: safeRate(item.lunchDinnerDaysCount, daysInMonth(item.month)),
+      }));
 
     return {
       id: candidate.id,
@@ -2138,6 +2208,29 @@ export class CandidateRepository {
         lunchDinnerP50,
         daysCount: monthStatResolved?.daysCount ?? 0,
         totalAmount: toAmount(monthStatResolved?.totalAmount),
+      },
+      consumptionAnalysis: {
+        recentMonths,
+        monthOverMonthBaseMonth: previousTrend?.month ?? null,
+        yearOverYearBaseMonth: yearAgoTrend?.month ?? null,
+        monthOverMonth: {
+          totalAmount: buildMetricComparison(currentTrend.totalAmount, previousTrend?.totalAmount ?? null),
+          breakfastAvg: buildMetricComparison(currentTrend.breakfastAvg, previousTrend?.breakfastAvg ?? null),
+          lunchDinnerAvg: buildMetricComparison(currentTrend.lunchDinnerAvg, previousTrend?.lunchDinnerAvg ?? null),
+          daysCount: buildMetricComparison(currentTrend.daysCount, previousTrend?.daysCount ?? null),
+        },
+        yearOverYear: {
+          totalAmount: buildMetricComparison(currentTrend.totalAmount, yearAgoTrend?.totalAmount ?? null),
+          breakfastAvg: buildMetricComparison(currentTrend.breakfastAvg, yearAgoTrend?.breakfastAvg ?? null),
+          lunchDinnerAvg: buildMetricComparison(currentTrend.lunchDinnerAvg, yearAgoTrend?.lunchDinnerAvg ?? null),
+          daysCount: buildMetricComparison(currentTrend.daysCount, yearAgoTrend?.daysCount ?? null),
+        },
+        latestInsights: {
+          breakfastGapToP50: roundAmount(currentTrend.breakfastAvg - currentTrend.breakfastP50),
+          lunchDinnerGapToP50: roundAmount(currentTrend.lunchDinnerAvg - currentTrend.lunchDinnerP50),
+          breakfastActiveRate: safeRate(currentTrend.breakfastDaysCount, daysInMonth(currentTrend.month)),
+          lunchDinnerActiveRate: safeRate(currentTrend.lunchDinnerDaysCount, daysInMonth(currentTrend.month)),
+        },
       },
       hitRules: candidate.hitRules.map((item) => item.ruleText),
       tags: uniqueTags(collapseActiveTagsByStage(tags).map((item) => normalizeMojibakeText(item))),
@@ -2731,23 +2824,17 @@ export class CandidateRepository {
       return '原因：当前学生基础数据为空或无在籍学生。';
     }
 
-    const rollingMonths = [shiftMonth(month, -2), shiftMonth(month, -1), month].filter(Boolean);
-    if (rollingMonths.length !== 3) {
-      return `原因：月份格式不正确（${month}），无法计算近3个月滚动区间。`;
-    }
-
-    const tableNames = await Promise.all(rollingMonths.map((m) => this.resolveActualTransactionTableName(m)));
-    const missingMonths = rollingMonths.filter((_, idx) => !tableNames[idx]);
+    const tableName = await this.resolveActualTransactionTableName(month);
+    const missingMonths = tableName ? [] : [month];
     if (missingMonths.length > 0) {
       return `原因：缺少食堂消费流水表（${missingMonths.join('、')}）。`;
     }
 
-    const currentTable = tableNames[2];
-    if (currentTable) {
+    if (tableName) {
       const rows = await prisma.$queryRawUnsafe<Array<{ cnt: unknown }>>(
         `
           SELECT COUNT(*) AS cnt
-          FROM \`${currentTable}\`
+          FROM \`${tableName}\`
           WHERE amount > 0
             AND mealSlot IN ('breakfast', 'lunch', 'dinner', 'lunch_dinner', 'night', 'night_snack', 'supper', 'late_night')
           LIMIT 1
@@ -2759,7 +2846,7 @@ export class CandidateRepository {
       }
     }
 
-    return `原因：候选人生成前置条件不足（需要近3个月流水：${rollingMonths.join('、')}）。`;
+    return `原因：候选人生成前置条件不足（请检查 ${month} 的消费流水、困难认定和补助标准数据是否完整）。`;
   }
 
   async invalidateTag(tagRecordId: string) {

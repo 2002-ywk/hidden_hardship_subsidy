@@ -154,56 +154,6 @@ export function findSpecialDifficultyCandidates(stats, thresholds, month) {
     }));
 }
 
-export function findPotentialDifficultyCandidates(students, transactions, selectedMonth, config) {
-  const months = previousMonths(selectedMonth, 3);
-  const monthlyAnalyses = new Map(
-    months.map((month) => {
-      const stats = computeMonthlyStats(students, transactions, month, config);
-      return [month, { stats, thresholds: computeThresholds(stats, config) }];
-    })
-  );
-
-  const latestStats = monthlyAnalyses.get(selectedMonth)?.stats || [];
-  const candidates = [];
-
-  for (const student of students) {
-    if (!isActiveUndergraduate(student) || student.isSpecialDifficulty) continue;
-
-    const matchedEveryMonth = months.every((month) => {
-      const analysis = monthlyAnalyses.get(month);
-      const row = analysis.stats.find((item) => item.student.id === student.id);
-      if (!row) return false;
-
-      const inSchoolDays = student.inSchoolDaysByMonth?.[month] || monthDays(month);
-      const enoughDays = row.consumeDays >= Math.ceil(inSchoolDays * 0.5);
-      const lowBreakfast =
-        row.breakfastAverage !== null &&
-        analysis.thresholds.breakfastP10 !== null &&
-        row.breakfastAverage <= analysis.thresholds.breakfastP10;
-      const lowLunchDinner =
-        row.lunchDinnerAverage !== null &&
-        analysis.thresholds.lunchDinnerP10 !== null &&
-        row.lunchDinnerAverage <= analysis.thresholds.lunchDinnerP10;
-
-      return enoughDays && (lowBreakfast || lowLunchDinner);
-    });
-
-    if (!matchedEveryMonth) continue;
-
-    const latestRow = latestStats.find((row) => row.student.id === student.id);
-    if (!latestRow) continue;
-
-    candidates.push({
-      ...latestRow,
-      candidateType: "潜在困难连续预警",
-      matchedMonths: months,
-      reason: `连续${months.length}个月早餐或午晚餐处于全校10%以下；消费天数达到在校天数50%`
-    });
-  }
-
-  return candidates;
-}
-
 export function mergeCandidates(...candidateGroups) {
   const candidateByStudent = new Map();
 
@@ -324,8 +274,7 @@ export function buildAnalysis(students, transactions, selectedMonth, config) {
   const stats = computeMonthlyStats(students, transactions, selectedMonth, monthConfig);
   const thresholds = computeThresholds(stats, monthConfig);
   const specialCandidates = findSpecialDifficultyCandidates(stats, thresholds, selectedMonth);
-  const potentialCandidates = findPotentialDifficultyCandidates(students, transactions, selectedMonth, monthConfig);
-  const candidates = mergeCandidates(specialCandidates, potentialCandidates).sort(compareCandidateHardship);
+  const candidates = mergeCandidates(specialCandidates).sort(compareCandidateHardship);
   const totalActiveUndergraduates = stats.length;
   const finalCandidates = rankFinalSubsidyStudents(
     candidates,
@@ -340,7 +289,6 @@ export function buildAnalysis(students, transactions, selectedMonth, config) {
     stats,
     thresholds,
     specialCandidates,
-    potentialCandidates,
     candidates,
     totalActiveUndergraduates,
     finalCandidates,

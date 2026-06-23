@@ -20,6 +20,7 @@ import { cn } from '@/src/lib/utils';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+import { AuthUserProvider } from '@/src/components/AuthUserContext';
 import { fetchMe, searchCandidates } from '@/src/lib/api';
 import type { AuthUser, CandidateSearchItem, UserRole } from '@/src/types';
 
@@ -160,7 +161,7 @@ export default function Layout({ children }: LayoutProps) {
             <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white">
               <ShieldCheck size={20} />
             </div>
-            <span className="font-bold text-lg text-slate-900 tracking-tight">饮食补助系统</span>
+            <span className="font-bold text-lg text-slate-900 tracking-tight">隐形资助系统</span>
           </div>
 
           <ScrollArea className="flex-1 px-4">
@@ -303,7 +304,9 @@ export default function Layout({ children }: LayoutProps) {
           </div>
         </header>
 
-        <main className="flex-1 p-6 overflow-auto">{children}</main>
+        <main className="flex-1 p-6 overflow-auto">
+          <AuthUserProvider value={me}>{children}</AuthUserProvider>
+        </main>
       </div>
     </div>
   );

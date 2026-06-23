@@ -279,7 +279,7 @@ function renderSummary(analysis) {
 
   elements.summaryGrid.innerHTML = `
     ${summaryCard("全校本科生", `${analysis.totalActiveUndergraduates} 人`, "在籍在校本科生统计口径")}
-    ${summaryCard("当月候选", `${analysis.candidates.length} 人`, "包含特别困难筛查和潜在困难预警")}
+    ${summaryCard("当月候选", `${analysis.candidates.length} 人`, "特别困难补助筛查结果")}
     ${summaryCard("辅导员待处理", `${(labelCounts[LABELS.pending] || 0) + (labelCounts[LABELS.overdue] || 0)} 人`, "待确认和逾期未确认总人数")}
     ${summaryCard("最终资助", `${analysis.finalCandidates.length} 人`, "按已确认需补助名单取前 1.5%")}
     ${summaryCard("早餐补助标准", money(analysis.thresholds.breakfastP25), "全校早餐单次均值 25% 分位")}
@@ -357,7 +357,6 @@ function renderDashboard(analysis) {
         <h3>补贴规则概览</h3>
         <div class="rule-list">
           <div>特别困难：登记特别困难、早餐和午晚餐单次平均消费不高于 25% 分位、消费天数超过半月。</div>
-          <div>潜在困难：连续 3 个月早餐或午晚餐单次平均消费低于全校 10% 分位，且消费天数达到在校天数 50%。</div>
           <div>最终资助：从辅导员确认“需要补助”的名单中自动取前 1.5%，月度补助金额封顶 500 元。</div>
         </div>
       </article>
@@ -501,7 +500,6 @@ function renderSettings(analysis) {
         <h3>本月统计提示</h3>
         <div class="setting-list">
           <div><span>特别困难候选</span><strong>${analysis.specialCandidates.length} 人</strong></div>
-          <div><span>潜在困难预警</span><strong>${analysis.potentialCandidates.length} 人</strong></div>
           <div><span>逾期未确认</span><strong>${getLabelCounts(analysis)[LABELS.overdue] || 0} 人</strong></div>
           <div><span>最终资助</span><strong>${analysis.finalCandidates.length} 人</strong></div>
         </div>

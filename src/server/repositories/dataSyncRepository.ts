@@ -470,6 +470,7 @@ async function mapWithConcurrency<T, R>(
 
 export class DataSyncRepository {
   private cancelledJobIds = new Set<string>();
+  private pendingJobPromises = new Map<string, Promise<void>>();
   private allowEmptyFullRefresh = (process.env.FULL_REFRESH_ALLOW_EMPTY ?? '').trim() === '1';
   private syncJobTextLimit = Math.max(20, Number(process.env.SYNC_JOB_TEXT_LIMIT) || 180);
 
@@ -749,7 +750,11 @@ export class DataSyncRepository {
       syncMonth: source === 'jmu_cafeteria_transaction' && syncMonths.length === 1 ? syncMonths[0] : undefined,
       syncMonths: source === 'jmu_cafeteria_transaction' ? syncMonths : undefined,
     });
-    void this.executeSyncJob(job.id, payloadWithIncrement, resumePage);
+    const executionPromise = this.executeSyncJob(job.id, payloadWithIncrement, resumePage);
+    this.pendingJobPromises.set(job.id, executionPromise);
+    void executionPromise.finally(() => {
+      this.pendingJobPromises.delete(job.id);
+    });
 
     return {
       message: '同步任务已启动',
@@ -763,6 +768,48 @@ export class DataSyncRepository {
         finishedAt: '-',
       },
     };
+  }
+
+  async runSyncAndWait(inputPayload: SyncRunRequest): Promise<SyncRunResponse> {
+    const result = await this.runSync(inputPayload);
+    await this.waitForJobCompletion(result.data.jobId);
+    return result;
+  }
+
+  async hasRunningSyncJobs() {
+    const count = await prisma.syncJob.count({
+      where: {
+        status: 'running',
+        NOT: {
+          source: {
+            startsWith: 'system_',
+          },
+        },
+      },
+    });
+    return count > 0;
+  }
+
+  private async waitForJobCompletion(jobId: string) {
+    const pending = this.pendingJobPromises.get(jobId);
+    if (pending) {
+      await pending;
+      return;
+    }
+
+    const deadline = Date.now() + 12 * 60 * 60 * 1000;
+    while (Date.now() < deadline) {
+      const job = await prisma.syncJob.findUnique({
+        where: { id: jobId },
+        select: { status: true },
+      });
+      if (!job || job.status !== 'running') {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+
+    throw new Error(`等待同步任务完成超时：${jobId}`);
   }
 
   private async executeSyncJob(jobId: string, inputPayload: SyncRunRequest, resumePage = 1) {

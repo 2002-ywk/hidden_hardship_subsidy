@@ -12,7 +12,7 @@ function pad2(value: number) {
 function pad3(value: number) {
   return String(value).padStart(3, '0');
 }
-
+ 
 export type DateTimeParts = {
   year: string;
   month: string;

@@ -10,6 +10,7 @@ import { candidateRepository } from "./src/server/repositories/candidateReposito
 import { dataSyncRepository } from "./src/server/repositories/dataSyncRepository";
 import { messageCenterClient } from "./src/server/repositories/messageCenterClient";
 import { referenceDataRepository } from "./src/server/repositories/referenceDataRepository";
+import { startMonthlySyncScheduler } from "./src/server/scheduler/monthlySyncScheduler";
 import { prisma } from "./src/server/db/client";
 import type {
   AuthLoginRequest,
@@ -49,6 +50,7 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
   const VITE_HMR_PORT = Number(process.env.VITE_HMR_PORT) || 24678;
+  let stopMonthlySyncScheduler: (() => void) | null = null;
 
   app.use(express.json());
   app.use(
@@ -442,7 +444,7 @@ async function startServer() {
       toPersons,
       sendType: ["WEBSITE", "SUPERAPP"],
       data: {
-        title: "饮食补助审核提醒",
+        title: "隐形资助系统审核提醒",
         url: studentDetailUrl,
         mobileUrl: studentDetailUrl,
         paramValueJson: {
@@ -617,7 +619,7 @@ async function startServer() {
     const decisionLabel = params.decision === "approve" ? "通过" : params.decision === "reject" ? "驳回" : "处理";
     const stageLabel = stageLabelMap[String(params.stage ?? "")] ?? String(params.stage ?? "审核");
     const month = String(params.month ?? "").trim();
-    const title = "困难补助审核结果通知";
+    const title = "隐形资助系统审核结果通知";
     const content = `${params.studentName ?? ""}同学，您在${month || "当前批次"}的申请已由${stageLabel}${decisionLabel}。`;
     const comment = String(params.comment ?? "").trim();
 
@@ -1125,6 +1127,26 @@ async function startServer() {
     }
   });
 
+  app.get("/api/dashboard/summary", async (req, res) => {
+    try {
+      const user = getSessionUser(req);
+      res.json(await referenceDataRepository.getDashboardSummary(user));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "dashboard summary failed";
+      res.status(500).json({ message });
+    }
+  });
+
+  app.get("/api/dashboard/analytics", async (req, res) => {
+    try {
+      const user = getSessionUser(req);
+      res.json(await referenceDataRepository.getDashboardAnalytics(user));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "dashboard analytics failed";
+      res.status(500).json({ message });
+    }
+  });
+
   app.get("/api/audit-tasks", async (req, res) => {
     const user = getSessionUser(req);
     res.json(await referenceDataRepository.listAuditTasks(user));
@@ -1521,11 +1543,17 @@ async function startServer() {
       const counselorName = typeof req.query.counselorName === "string" ? req.query.counselorName : "";
       const page = Number.isFinite(queryPage) ? Math.max(1, Math.floor(queryPage)) : 1;
       const pageSize = Number.isFinite(queryPageSize) ? Math.max(1, Math.min(500, Math.floor(queryPageSize))) : 100;
+      const candidateType = req.query.candidateType === "special_difficulty" ? req.query.candidateType : undefined;
+      const sortBy = req.query.sortBy === "college" ? "college" : undefined;
+      const sortDirection = req.query.sortDirection === "desc" ? "desc" : req.query.sortDirection === "asc" ? "asc" : undefined;
       res.json(
         await candidateRepository.getCandidateSnapshot(month, page, pageSize, user, {
           college,
           counselorEmployeeNo,
           counselorName,
+          candidateType,
+          sortBy,
+          sortDirection,
         })
       );
     } catch (error) {
@@ -1865,6 +1893,7 @@ async function startServer() {
   const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
+  stopMonthlySyncScheduler = startMonthlySyncScheduler();
   if (enableAutoCandidateReminder) {
     setTimeout(() => {
       void runAutoCandidateReminder();
@@ -1886,6 +1915,16 @@ async function startServer() {
     console.error(err?.message ?? "server error");
     process.exit(1);
   });
+
+  const shutdown = () => {
+    stopMonthlySyncScheduler?.();
+    server.close(() => {
+      void prisma.$disconnect();
+      process.exit(0);
+    });
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
 }
 
 loadEnvironment();

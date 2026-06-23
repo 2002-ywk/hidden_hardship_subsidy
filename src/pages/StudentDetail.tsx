@@ -1,13 +1,14 @@
 ﻿import React from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { AlertCircle, ArrowLeft, ReceiptText, ShieldCheck, Tags, UserRound } from 'lucide-react';
+import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { fetchMe, fetchStudentDetail, submitReview } from '@/src/lib/api';
-import type { ReviewStage, StudentDetail as StudentDetailModel, UserRole } from '@/src/types';
+import type { ReviewStage, StudentDetail as StudentDetailModel, StudentMetricComparison, UserRole } from '@/src/types';
 
 export default function StudentDetail() {
   const { studentId } = useParams();
@@ -105,7 +106,7 @@ export default function StudentDetail() {
       const response = await submitReview(studentId, {
         stage: detail.currentStage,
         decision,
-        comment: decision === 'approve' ? '按当前业务流程流转到下一审核环节。' : '演示驳回动作。',
+        comment: decision === 'approve' ? '在学生详情中执行通过并流转。' : '在学生详情中执行驳回。',
         month: detail.month,
       });
       setDetail(response.data);
@@ -253,6 +254,113 @@ export default function StudentDetail() {
             <StatCard label="午晚餐天数" value={`${detail.monthlyStats.lunchDinnerDaysCount} 天`} />
             <StatCard label="早餐50%分位" value={`¥ ${detail.monthlyStats.breakfastP50.toFixed(2)}`} />
             <StatCard label="午晚餐50%分位" value={`¥ ${detail.monthlyStats.lunchDinnerP50.toFixed(2)}`} />
+          </div>
+
+          <div className="mt-6 grid gap-6 xl:grid-cols-2">
+            <Card className="border-none shadow-sm">
+              <CardHeader>
+                <CardTitle className="text-lg">环比与同比</CardTitle>
+                <CardDescription>
+                  环比基准：{detail.consumptionAnalysis.monthOverMonthBaseMonth || '暂无'}，同比基准：{detail.consumptionAnalysis.yearOverYearBaseMonth || '暂无'}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="grid gap-4 md:grid-cols-2">
+                <ComparisonCard title="月均总消费" mom={detail.consumptionAnalysis.monthOverMonth.totalAmount} yoy={detail.consumptionAnalysis.yearOverYear.totalAmount} unit="¥" />
+                <ComparisonCard title="早餐次均消费" mom={detail.consumptionAnalysis.monthOverMonth.breakfastAvg} yoy={detail.consumptionAnalysis.yearOverYear.breakfastAvg} unit="¥" />
+                <ComparisonCard title="午晚餐次均消费" mom={detail.consumptionAnalysis.monthOverMonth.lunchDinnerAvg} yoy={detail.consumptionAnalysis.yearOverYear.lunchDinnerAvg} unit="¥" />
+                <ComparisonCard title="消费天数" mom={detail.consumptionAnalysis.monthOverMonth.daysCount} yoy={detail.consumptionAnalysis.yearOverYear.daysCount} unit="天" />
+              </CardContent>
+            </Card>
+
+            <Card className="border-none shadow-sm">
+              <CardHeader>
+                <CardTitle className="text-lg">行为洞察</CardTitle>
+                <CardDescription>从全校中位水平和个人消费活跃度两个角度看当前月份表现。</CardDescription>
+              </CardHeader>
+              <CardContent className="grid gap-4 md:grid-cols-2">
+                <InsightBlock
+                  title="早餐相对全校P50"
+                  value={`${detail.consumptionAnalysis.latestInsights.breakfastGapToP50 >= 0 ? '+' : ''}¥ ${detail.consumptionAnalysis.latestInsights.breakfastGapToP50.toFixed(2)}`}
+                  hint={detail.consumptionAnalysis.latestInsights.breakfastGapToP50 >= 0 ? '高于全校早餐中位水平' : '低于全校早餐中位水平'}
+                />
+                <InsightBlock
+                  title="午晚餐相对全校P50"
+                  value={`${detail.consumptionAnalysis.latestInsights.lunchDinnerGapToP50 >= 0 ? '+' : ''}¥ ${detail.consumptionAnalysis.latestInsights.lunchDinnerGapToP50.toFixed(2)}`}
+                  hint={detail.consumptionAnalysis.latestInsights.lunchDinnerGapToP50 >= 0 ? '高于全校午晚餐中位水平' : '低于全校午晚餐中位水平'}
+                />
+                <InsightBlock
+                  title="早餐活跃度"
+                  value={`${(detail.consumptionAnalysis.latestInsights.breakfastActiveRate * 100).toFixed(1)}%`}
+                  hint="当月有早餐消费的日期占当月自然日比例"
+                />
+                <InsightBlock
+                  title="午晚餐活跃度"
+                  value={`${(detail.consumptionAnalysis.latestInsights.lunchDinnerActiveRate * 100).toFixed(1)}%`}
+                  hint="当月有午/晚餐消费的日期占当月自然日比例"
+                />
+              </CardContent>
+            </Card>
+          </div>
+
+          <div className="mt-6 grid gap-6 xl:grid-cols-2">
+            <Card className="border-none shadow-sm">
+              <CardHeader>
+                <CardTitle className="text-lg">次均消费趋势</CardTitle>
+                <CardDescription>近 6 个月早餐、午晚餐次均消费与全校 50% 分位线对照。</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="h-[300px] w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={detail.consumptionAnalysis.recentMonths}>
+                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                      <XAxis dataKey="label" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                      <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} tickFormatter={(value) => `¥${value}`} />
+                      <Tooltip
+                        formatter={(value, name) => [`¥ ${Number(value).toFixed(2)}`, name]}
+                        contentStyle={{ backgroundColor: '#fff', borderRadius: '8px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}
+                      />
+                      <Legend />
+                      <Line type="monotone" dataKey="breakfastAvg" name="早餐次均" stroke="#2563eb" strokeWidth={2.5} dot={{ r: 2 }} />
+                      <Line type="monotone" dataKey="breakfastP50" name="早餐P50" stroke="#f59e0b" strokeWidth={2} dot={{ r: 2 }} strokeDasharray="6 4" />
+                      <Line type="monotone" dataKey="lunchDinnerAvg" name="午晚餐次均" stroke="#059669" strokeWidth={2.5} dot={{ r: 2 }} />
+                      <Line type="monotone" dataKey="lunchDinnerP50" name="午晚餐P50" stroke="#7c3aed" strokeWidth={2} dot={{ r: 2 }} strokeDasharray="6 4" />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card className="border-none shadow-sm">
+              <CardHeader>
+                <CardTitle className="text-lg">总消费与活跃天数趋势</CardTitle>
+                <CardDescription>观察消费金额变化是否来自消费频次、到校活跃度或餐次结构变化。</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="h-[300px] w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={detail.consumptionAnalysis.recentMonths}>
+                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                      <XAxis dataKey="label" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                      <YAxis yAxisId="left" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} tickFormatter={(value) => `¥${value}`} />
+                      <YAxis yAxisId="right" orientation="right" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                      <Tooltip
+                        formatter={(value, name) => {
+                          if (name === '月总消费') return [`¥ ${Number(value).toFixed(2)}`, name];
+                          if (String(name).includes('活跃度')) return [`${(Number(value) * 100).toFixed(2)}%`, name];
+                          return [`${Number(value).toFixed(2)} 天`, name];
+                        }}
+                        contentStyle={{ backgroundColor: '#fff', borderRadius: '8px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}
+                      />
+                      <Legend />
+                      <Line type="monotone" dataKey="totalAmount" name="月总消费" yAxisId="left" stroke="#0f766e" strokeWidth={2} dot={{ r: 2 }} />
+                      <Line type="monotone" dataKey="daysCount" name="消费天数" yAxisId="right" stroke="#dc2626" strokeWidth={2} dot={{ r: 2 }} />
+                      <Line type="monotone" dataKey="breakfastActiveRate" name="早餐活跃度" yAxisId="right" stroke="#7c3aed" strokeWidth={2} dot={{ r: 2 }} />
+                      <Line type="monotone" dataKey="lunchDinnerActiveRate" name="午晚餐活跃度" yAxisId="right" stroke="#f59e0b" strokeWidth={2} dot={{ r: 2 }} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </CardContent>
+            </Card>
           </div>
         </TabsContent>
 
@@ -423,4 +531,49 @@ function StatCard({ label, value }: { label: string; value: string }) {
       </CardContent>
     </Card>
   );
+}
+
+function ComparisonCard({
+  title,
+  mom,
+  yoy,
+  unit,
+}: {
+  title: string;
+  mom: StudentMetricComparison;
+  yoy: StudentMetricComparison;
+  unit: string;
+}) {
+  return (
+    <div className="rounded-2xl bg-slate-50 px-4 py-4 ring-1 ring-slate-100">
+      <p className="text-sm font-semibold text-slate-900">{title}</p>
+      <p className="mt-2 text-2xl font-bold text-slate-900">{formatMetricValue(mom.current, unit)}</p>
+      <p className="mt-2 text-xs text-slate-600">环比：{formatComparisonText(mom, unit)}</p>
+      <p className="mt-1 text-xs text-slate-600">同比：{formatComparisonText(yoy, unit)}</p>
+    </div>
+  );
+}
+
+function InsightBlock({ title, value, hint }: { title: string; value: string; hint: string }) {
+  return (
+    <div className="rounded-2xl bg-slate-50 px-4 py-4 ring-1 ring-slate-100">
+      <p className="text-sm font-semibold text-slate-900">{title}</p>
+      <p className="mt-2 text-2xl font-bold text-slate-900">{value}</p>
+      <p className="mt-2 text-xs leading-5 text-slate-500">{hint}</p>
+    </div>
+  );
+}
+
+function formatMetricValue(value: number, unit: string) {
+  return unit === '¥' ? `¥ ${value.toFixed(2)}` : `${value.toFixed(2)} ${unit}`;
+}
+
+function formatComparisonText(metric: StudentMetricComparison, unit: string) {
+  if (metric.previous == null || metric.delta == null) return '暂无可比数据';
+  const deltaText =
+    unit === '¥'
+      ? `${metric.delta >= 0 ? '+' : ''}¥ ${metric.delta.toFixed(2)}`
+      : `${metric.delta >= 0 ? '+' : ''}${metric.delta.toFixed(2)} ${unit}`;
+  const rateText = metric.deltaRate == null ? '' : `（${metric.deltaRate >= 0 ? '+' : ''}${(metric.deltaRate * 100).toFixed(1)}%）`;
+  return `${deltaText}${rateText}`;
 }

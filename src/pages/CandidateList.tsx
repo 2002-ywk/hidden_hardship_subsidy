@@ -1,5 +1,5 @@
 ﻿import React from 'react';
-import { Bell, Eye } from 'lucide-react';
+import { ArrowDown, ArrowUp, ArrowUpDown, Bell, Eye } from 'lucide-react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -58,6 +58,7 @@ export default function CandidateList() {
   const [counselorFilter, setCounselorFilter] = React.useState('');
   const [counselorSuggestions, setCounselorSuggestions] = React.useState<CounselorLookupItem[]>([]);
   const [showCounselorSuggestions, setShowCounselorSuggestions] = React.useState(false);
+  const [collegeSortDirection, setCollegeSortDirection] = React.useState<'asc' | 'desc' | null>(null);
   const [sendingAllReminder, setSendingAllReminder] = React.useState(false);
   const [sendingReminderStudentId, setSendingReminderStudentId] = React.useState<string | null>(null);
   const [actionMessage, setActionMessage] = React.useState<string | null>(null);
@@ -160,6 +161,8 @@ export default function CandidateList() {
       college: collegeFilter,
       counselorEmployeeNo: counselorFilter,
       counselorName: counselorFilter,
+      sortBy: collegeSortDirection ? 'college' : undefined,
+      sortDirection: collegeSortDirection ?? undefined,
     })
       .then((response) => {
         if (!mounted) return;
@@ -180,7 +183,7 @@ export default function CandidateList() {
     return () => {
       mounted = false;
     };
-  }, [month, page, pageSize, collegeFilter, counselorFilter]);
+  }, [month, page, pageSize, collegeFilter, counselorFilter, collegeSortDirection]);
 
   const handlePrev = () => setPage((p) => Math.max(1, p - 1));
   const handleNext = () => setPage((p) => Math.min(totalPages, p + 1));
@@ -222,6 +225,18 @@ export default function CandidateList() {
     setShowCounselorSuggestions(false);
   }, []);
 
+  const toggleCollegeSort = React.useCallback(() => {
+    setPage(1);
+    setCollegeSortDirection((prev) => {
+      if (prev === null) return 'asc';
+      if (prev === 'asc') return 'desc';
+      return null;
+    });
+  }, []);
+
+  const collegeSortIcon =
+    collegeSortDirection === 'asc' ? <ArrowUp size={14} /> : collegeSortDirection === 'desc' ? <ArrowDown size={14} /> : <ArrowUpDown size={14} />;
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -243,7 +258,7 @@ export default function CandidateList() {
           <CardDescription>月份：{month}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-end">
             <div className="flex items-center gap-2">
               <span className="text-sm text-slate-600">月份</span>
               <select
@@ -267,7 +282,7 @@ export default function CandidateList() {
                 ))}
               </select>
             </div>
-            <div className="grid w-full grid-cols-1 gap-2 sm:w-auto sm:grid-cols-2">
+            <div className="grid w-full grid-cols-1 gap-2 sm:grid-cols-2 lg:ml-auto lg:w-auto lg:grid-cols-2">
               {canUseAdvancedFilters ? (
                 <>
                   <select
@@ -331,7 +346,16 @@ export default function CandidateList() {
                   <TableHead className="w-[90px]">排名</TableHead>
                   <TableHead className="w-[140px]">学号</TableHead>
                   <TableHead>姓名</TableHead>
-                  <TableHead>学院</TableHead>
+                  <TableHead>
+                    <button
+                      type="button"
+                      className="inline-flex items-center gap-1 text-left font-medium text-slate-700 transition hover:text-slate-900"
+                      onClick={toggleCollegeSort}
+                    >
+                      学院
+                      {collegeSortIcon}
+                    </button>
+                  </TableHead>
                   <TableHead>班级</TableHead>
                   <TableHead>辅导员</TableHead>
                   <TableHead className="w-[120px]">次均消费</TableHead>

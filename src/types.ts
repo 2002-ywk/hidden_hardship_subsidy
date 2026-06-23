@@ -1,6 +1,6 @@
 export type UserRole = 'admin' | 'student_affairs' | 'college_admin' | 'counselor';
 
-export type CandidateType = 'special_difficulty' | 'potential_difficulty';
+export type CandidateType = 'special_difficulty';
 
 export type BatchStatus =
   | 'syncing'
@@ -110,6 +110,46 @@ export interface StudentMonthlyStats {
   totalAmount: number;
 }
 
+export interface StudentMetricComparison {
+  current: number;
+  previous: number | null;
+  delta: number | null;
+  deltaRate: number | null;
+}
+
+export interface StudentConsumptionTrendPoint extends StudentMonthlyStats {
+  month: string;
+  label: string;
+  breakfastGapToP50: number;
+  lunchDinnerGapToP50: number;
+  breakfastActiveRate: number;
+  lunchDinnerActiveRate: number;
+}
+
+export interface StudentConsumptionAnalysis {
+  recentMonths: StudentConsumptionTrendPoint[];
+  monthOverMonthBaseMonth: string | null;
+  yearOverYearBaseMonth: string | null;
+  monthOverMonth: {
+    totalAmount: StudentMetricComparison;
+    breakfastAvg: StudentMetricComparison;
+    lunchDinnerAvg: StudentMetricComparison;
+    daysCount: StudentMetricComparison;
+  };
+  yearOverYear: {
+    totalAmount: StudentMetricComparison;
+    breakfastAvg: StudentMetricComparison;
+    lunchDinnerAvg: StudentMetricComparison;
+    daysCount: StudentMetricComparison;
+  };
+  latestInsights: {
+    breakfastGapToP50: number;
+    lunchDinnerGapToP50: number;
+    breakfastActiveRate: number;
+    lunchDinnerActiveRate: number;
+  };
+}
+
 export interface TagTimelineItem {
   id: string;
   tag: string;
@@ -163,6 +203,7 @@ export interface StudentDetail {
   workflowStatusLabel: string;
   currentStage: ReviewStage;
   monthlyStats: StudentMonthlyStats;
+  consumptionAnalysis: StudentConsumptionAnalysis;
   hitRules: string[];
   tags: string[];
   tagTimeline: TagTimelineItem[];
@@ -329,6 +370,46 @@ export interface ActivityItem {
   type: 'confirm' | 'audit' | 'system' | 'final';
 }
 
+export interface ConsumptionAnalyticsPoint {
+  month: string;
+  name: string;
+  activeStudents: number;
+  breakfastStudents: number;
+  lunchDinnerStudents: number;
+  breakfastParticipationRate: number;
+  lunchDinnerParticipationRate: number;
+  breakfastP25: number;
+  breakfastP50: number;
+  breakfastAvg: number;
+  lunchDinnerP25: number;
+  lunchDinnerP50: number;
+  lunchDinnerAvg: number;
+  totalAvg: number;
+  daysAvg: number;
+  attendanceDaysAvg: number;
+}
+
+export interface ConsumptionAnalyticsSummary {
+  latestMonth: string;
+  sampleStudents: number;
+  breakfastParticipationRate: number;
+  lunchDinnerParticipationRate: number;
+  breakfastP25: number;
+  breakfastP50: number;
+  breakfastAvg: number;
+  lunchDinnerP25: number;
+  lunchDinnerP50: number;
+  lunchDinnerAvg: number;
+  totalAvg: number;
+  daysAvg: number;
+  attendanceDaysAvg: number;
+}
+
+export interface ConsumptionAnalytics {
+  series: ConsumptionAnalyticsPoint[];
+  latest: ConsumptionAnalyticsSummary | null;
+}
+
 export interface SystemConfig {
   breakfastSlot: { start: string; end: string };
   lunchSlot: { start: string; end: string };
@@ -411,6 +492,17 @@ export interface DashboardResponse {
   stats: DashboardStatItem[];
   trends: TrendItem[];
   activities: ActivityItem[];
+  consumptionAnalytics: ConsumptionAnalytics;
+}
+
+export interface DashboardSummaryResponse {
+  stats: DashboardStatItem[];
+  activities: ActivityItem[];
+}
+
+export interface DashboardAnalyticsResponse {
+  trends: TrendItem[];
+  consumptionAnalytics: ConsumptionAnalytics;
 }
 
 export interface CandidateSearchItem {

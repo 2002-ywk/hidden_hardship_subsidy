@@ -5,6 +5,8 @@
   CandidateSearchResponse,
   CandidateReminderResponse,
   DashboardResponse,
+  DashboardSummaryResponse,
+  DashboardAnalyticsResponse,
   LoginRoleOption,
   ReviewTask,
   ReviewActionRequest,
@@ -79,6 +81,9 @@ type CandidateListFilters = {
   college?: string;
   counselorEmployeeNo?: string;
   counselorName?: string;
+  candidateType?: 'special_difficulty';
+  sortBy?: 'college';
+  sortDirection?: 'asc' | 'desc';
 };
 
 export function fetchCandidateList(month = '2026-04', page = 1, pageSize = 100, filters: CandidateListFilters = {}) {
@@ -89,6 +94,9 @@ export function fetchCandidateList(month = '2026-04', page = 1, pageSize = 100, 
   if (filters.college?.trim()) params.set('college', filters.college.trim());
   if (filters.counselorEmployeeNo?.trim()) params.set('counselorEmployeeNo', filters.counselorEmployeeNo.trim());
   if (filters.counselorName?.trim()) params.set('counselorName', filters.counselorName.trim());
+  if (filters.candidateType) params.set('candidateType', filters.candidateType);
+  if (filters.sortBy) params.set('sortBy', filters.sortBy);
+  if (filters.sortDirection) params.set('sortDirection', filters.sortDirection);
   return requestJson<CandidateListResponse>(`/api/candidates?${params.toString()}`);
 }
 
@@ -127,6 +135,14 @@ export function remindAllCandidates(month: string) {
 
 export function fetchDashboardData() {
   return requestJson<DashboardResponse>('/api/dashboard');
+}
+
+export function fetchDashboardSummary() {
+  return requestJson<DashboardSummaryResponse>('/api/dashboard/summary');
+}
+
+export function fetchDashboardAnalytics() {
+  return requestJson<DashboardAnalyticsResponse>('/api/dashboard/analytics');
 }
 
 export function fetchBatches() {
